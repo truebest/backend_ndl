@@ -1,0 +1,57 @@
+# Read-only ABI fingerprint captured from tmp/tvlibs-27U731SA-20260715.
+# The proprietary binaries are not part of backend_ndl.
+
+ABI_PROFILE v2-window-id-init
+LINK_STUB no
+
+FILE libNDL_directmedia.so.1.0.0
+SHA256 7ad9c70b82faea9c389079937e54bf9c9a8c4036bfda68b5a2460434e34f6847
+BUILD_ID 1acf1c7b61bf5c7202fe7e87a88f354749b7adb8
+SONAME libNDL_directmedia.so.1
+NEEDED libdl.so.2
+NEEDED libgcc_s.so.1
+NEEDED libc.so.6
+
+FILE libNDL_directmedia_impl.so.1.0.0
+SHA256 1d09f394719d7889bc8115c931b834f7083eddec18fce55c27785619696f8974
+BUILD_ID cbfd13ffcdc8365725543ab899ca4c2e4bba5db1
+SONAME libNDL_directmedia_impl.so.1
+NEEDED libglib-2.0.so.0
+NEEDED libhelpers.so.2
+NEEDED libluna-service2.so.3
+NEEDED libpbnjson_cpp.so.2
+NEEDED libPmLogLib.so.3
+NEEDED libstdc++.so.6
+NEEDED libSDL2-2.0.so.0
+NEEDED libplayerAPIs.so.1
+NEEDED libasound.so.2
+NEEDED libgcc_s.so.1
+NEEDED libpthread.so.0
+NEEDED libc.so.6
+
+DIRECT_SYMBOLS 25
+NDL_DirectAudioGetAvailableBufferSize
+NDL_DirectAudioGetTotalBufferSize
+NDL_DirectAudioPlay
+NDL_DirectAudioRegisterCallback
+NDL_DirectAudioSupportMultiChannel
+NDL_DirectEffectGetAvailableBufferSize
+NDL_DirectEffectLoad
+NDL_DirectEffectPlay
+NDL_DirectEffectUnload
+NDL_DirectMediaGetError
+NDL_DirectMediaInit
+NDL_DirectMediaLoad
+NDL_DirectMediaQuit
+NDL_DirectMediaSetAppState
+NDL_DirectMediaSetWindowId
+NDL_DirectMediaUnload
+NDL_DirectMedia_DL_Finalize
+NDL_DirectMedia_DL_Initialize
+NDL_DirectMedia_DL_IsInitialized
+NDL_DirectVideoFlushRenderBuffer
+NDL_DirectVideoGetRenderBufferLength
+NDL_DirectVideoPlay
+NDL_DirectVideoSetArea
+NDL_DirectVideoSetFrameDropThreshold
+NDL_DirectVideoSetHDRInfo

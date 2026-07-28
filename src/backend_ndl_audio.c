@@ -9,8 +9,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#if defined(BACKEND_NDL_ENABLED) && BACKEND_NDL_ENABLED
-
 const char *backend_ndl_pcm_channel_mode(uint16_t channels) {
     switch (channels) {
         case 1:
@@ -82,46 +80,87 @@ BackendNdlResult backend_ndl_fill_pcm_info(const BackendNdlPcmInfo *pcm,
     return BACKEND_NDL_OK;
 }
 
-BackendNdlResult backend_ndl_audio_fill_media_info_locked(BackendNdl *ctx,
-                                                          BackendNdlMediaInfo *out) {
-    if (ctx->abi_profile == BACKEND_NDL_ABI_V2_CALLBACK_INIT) {
-        const char *mode = backend_ndl_pcm_channel_mode(ctx->pcm.channels);
-        int rate = backend_ndl_pcm_sample_rate(ctx->abi_profile, ctx->pcm.sample_rate_hz);
-        if (!mode || rate == 0 || ctx->pcm.channels > 2) {
+BackendNdlResult backend_ndl_audio_fill_media_info(BackendNdlAbiProfile profile,
+                                                   const BackendNdlAudioInfo *audio,
+                                                   BackendNdlMediaInfo *out) {
+    if (audio->codec == BACKEND_NDL_AUDIO_OPUS) {
+        if (audio->channels != 2 || audio->sample_rate_hz != 48000) {
             return BACKEND_NDL_UNSUPPORTED;
         }
-        out->legacy.audio.pcm.type = BACKEND_NDL_LEGACY_AUDIO_PCM;
-        out->legacy.audio.pcm.format = "S16LE";
-        out->legacy.audio.pcm.layout = "interleaved";
-        out->legacy.audio.pcm.channel_mode = mode;
-        out->legacy.audio.pcm.sample_rate = rate;
+        if (profile == BACKEND_NDL_ABI_V2_CALLBACK_INIT) {
+            out->callback.audio.opus.type = BACKEND_NDL_LEGACY_AUDIO_OPUS;
+            out->callback.audio.opus.channels = 2;
+            out->callback.audio.opus.sample_rate = 48.0;
+            out->callback.audio.opus.stream_header = NULL;
+        } else {
+            out->current.audioDataInfo.audioCodec = NDL_DIRECTAUDIO_SRC_TYPE_OPUS;
+            out->current.audioDataInfo.audio_data.opusInfo.channels = 2;
+            out->current.audioDataInfo.audio_data.opusInfo.sampleRate = 48.0;
+            out->current.audioDataInfo.audio_data.opusInfo.streamHeader = NULL;
+        }
         return BACKEND_NDL_OK;
     }
+    if (audio->codec != BACKEND_NDL_AUDIO_PCM_S16LE) {
+        return BACKEND_NDL_UNSUPPORTED;
+    }
+    if (profile == BACKEND_NDL_ABI_V2_CALLBACK_INIT) {
+        const char *mode = backend_ndl_pcm_channel_mode(audio->channels);
+        int rate = backend_ndl_pcm_sample_rate(profile, audio->sample_rate_hz);
+        if (!mode || rate == 0 || audio->channels > 2) {
+            return BACKEND_NDL_UNSUPPORTED;
+        }
+        out->callback.audio.pcm.type = BACKEND_NDL_LEGACY_AUDIO_PCM;
+        out->callback.audio.pcm.format = "S16LE";
+        out->callback.audio.pcm.layout = "interleaved";
+        out->callback.audio.pcm.channel_mode = mode;
+        out->callback.audio.pcm.sample_rate = rate;
+        return BACKEND_NDL_OK;
+    }
+    BackendNdlPcmInfo pcm = {
+        .sample_rate_hz = audio->sample_rate_hz,
+        .channels = audio->channels,
+    };
     BackendNdlResult result = backend_ndl_fill_pcm_info(
-        &ctx->pcm, &out->current.audioDataInfo.audio_data.pcmInfo);
+        &pcm, &out->current.audioDataInfo.audio_data.pcmInfo);
     if (result == BACKEND_NDL_OK) {
         out->current.audioDataInfo.audioCodec = NDL_DIRECTAUDIO_SRC_TYPE_PCM;
     }
     return result;
 }
 
-void backend_ndl_audio_after_load_locked(BackendNdl *ctx) {
-    if (!ctx->has_audio || !ctx->config.prime_pcm_after_load || !ctx->api.DirectAudioPlay) {
-        return;
+BackendNdlResult backend_ndl_audio_after_load_locked(BackendNdl *ctx) {
+    if (!ctx->media.has_audio || !ctx->config.prime_pcm_after_load ||
+        !ctx->api.DirectAudioPlay) {
+        return BACKEND_NDL_OK;
     }
-    unsigned short silence[6] = {0};
-    unsigned int size = (unsigned int)ctx->pcm.channels * (unsigned int)sizeof(unsigned short);
+    const BackendNdlAudioInfo *audio = &ctx->media.audio;
+    static const unsigned char opus_stereo_silence[] = {0xec, 0xff, 0xfe};
+    unsigned short pcm_silence[6] = {0};
+    void *silence = pcm_silence;
+    unsigned int size =
+        (unsigned int)audio->channels * (unsigned int)sizeof(unsigned short);
+    if (audio->codec == BACKEND_NDL_AUDIO_OPUS) {
+        silence = (void *)opus_stereo_silence;
+        size = sizeof(opus_stereo_silence);
+    }
     uint64_t transition = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
     uint64_t temporary = transition | BACKEND_NDL_FEED_AUDIO_READY;
     long long pts = backend_ndl_media_time_for_state(ctx, temporary);
     int rc = ctx->api.DirectAudioPlay(silence, size, pts);
     if (rc != 0) {
         BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_WARN,
-                        "PCM priming failed rc=%d error=%s (continuing)", rc,
-                        backend_ndl_last_error(ctx));
+                        "audio priming failed codec=%d rc=%d error=%s%s",
+                        (int)audio->codec, rc,
+                        backend_ndl_last_error(ctx),
+                        audio->codec == BACKEND_NDL_AUDIO_OPUS
+                            ? " (rejecting Opus configuration)" : " (continuing)");
+        if (audio->codec == BACKEND_NDL_AUDIO_OPUS)
+            return BACKEND_NDL_UNSUPPORTED;
     } else {
-        BACKEND_NDL_DEBUG_LOG(ctx, "primed PCM sink: %u bytes pts=%lld", size, pts);
+        BACKEND_NDL_DEBUG_LOG(ctx, "primed audio sink: codec=%d bytes=%u pts=%lld",
+                              (int)audio->codec, size, pts);
     }
+    return BACKEND_NDL_OK;
 }
 
 BackendNdlMultichannelStatus backend_ndl_multichannel_from_query(int value) {
@@ -338,9 +377,10 @@ BackendNdlResult backend_ndl_effect_load(BackendNdl *ctx,
     if (fill != BACKEND_NDL_OK) return fill;
 
     pthread_mutex_lock(&ctx->lifecycle_lock);
-    if (ctx->effect_loaded) {
-        (void)ctx->api.DirectEffectUnload();
-        ctx->effect_loaded = false;
+    BackendNdlResult unload_result = backend_ndl_effect_unload_locked(ctx);
+    if (unload_result != BACKEND_NDL_OK) {
+        pthread_mutex_unlock(&ctx->lifecycle_lock);
+        return unload_result;
     }
     unsigned int preferred = 0;
     int rc = ctx->api.DirectEffectLoad(&tv_pcm, &preferred);
@@ -351,6 +391,25 @@ BackendNdlResult backend_ndl_effect_load(BackendNdl *ctx,
     }
     pthread_mutex_unlock(&ctx->lifecycle_lock);
     return rc == 0 ? BACKEND_NDL_OK : BACKEND_NDL_ERROR;
+}
+
+BackendNdlResult backend_ndl_effect_unload_locked(BackendNdl *ctx) {
+    if (!ctx->effect_loaded) {
+        return BACKEND_NDL_OK;
+    }
+    if (!ctx->api.DirectEffectUnload) {
+        return BACKEND_NDL_UNAVAILABLE;
+    }
+    int rc = ctx->api.DirectEffectUnload();
+    if (rc != 0) {
+        BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_ERROR,
+                        "NDL_DirectEffectUnload failed rc=%d error=%s", rc,
+                        backend_ndl_last_error(ctx));
+        return BACKEND_NDL_ERROR;
+    }
+    ctx->effect_loaded = false;
+    memset(&ctx->effect_pcm, 0, sizeof(ctx->effect_pcm));
+    return BACKEND_NDL_OK;
 }
 
 BackendNdlResult backend_ndl_effect_feed(BackendNdl *ctx, const void *data, size_t len) {
@@ -386,50 +445,11 @@ BackendNdlResult backend_ndl_effect_unload(BackendNdl *ctx) {
     if (!ctx) return BACKEND_NDL_INVALID_ARGUMENT;
     if ((ctx->capabilities & BACKEND_NDL_CAP_EFFECT) == 0) return BACKEND_NDL_UNAVAILABLE;
     pthread_mutex_lock(&ctx->lifecycle_lock);
-    int rc = 0;
-    if (ctx->effect_loaded) {
-        rc = ctx->api.DirectEffectUnload();
-        if (rc == 0) ctx->effect_loaded = false;
-    }
+    BackendNdlResult result = backend_ndl_effect_unload_locked(ctx);
     pthread_mutex_unlock(&ctx->lifecycle_lock);
-    return rc == 0 ? BACKEND_NDL_OK : BACKEND_NDL_ERROR;
+    return result;
 }
 
 bool backend_ndl_pcm_sample_rate_supported(uint32_t hz) {
     return backend_ndl_pcm_sample_rate(BACKEND_NDL_ABI_V2_WINDOW_ID_INIT, hz) != 0;
 }
-
-#else
-
-#include <backend_ndl/backend_ndl.h>
-
-BackendNdlResult backend_ndl_feed_audio(BackendNdl *ctx, const void *data, size_t len,
-                                        long long ndl_pts) {
-    (void)ctx; (void)data; (void)len; (void)ndl_pts; return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_get_audio_available(BackendNdl *ctx, int *available_bytes) {
-    (void)ctx; (void)available_bytes; return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_get_audio_total(BackendNdl *ctx, int *total_bytes) {
-    (void)ctx; (void)total_bytes; return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_get_multichannel_status(BackendNdl *ctx,
-                                                     BackendNdlMultichannelStatus *status) {
-    (void)ctx; (void)status; return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_effect_load(BackendNdl *ctx, const BackendNdlPcmInfo *pcm,
-                                        uint32_t *preferred_size) {
-    (void)ctx; (void)pcm; (void)preferred_size; return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_effect_feed(BackendNdl *ctx, const void *data, size_t len) {
-    (void)ctx; (void)data; (void)len; return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_get_effect_available(BackendNdl *ctx, uint32_t *available_bytes) {
-    (void)ctx; (void)available_bytes; return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_effect_unload(BackendNdl *ctx) {
-    (void)ctx; return BACKEND_NDL_UNAVAILABLE;
-}
-bool backend_ndl_pcm_sample_rate_supported(uint32_t hz) { (void)hz; return false; }
-
-#endif

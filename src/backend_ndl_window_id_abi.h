@@ -169,6 +169,12 @@ BACKEND_NDL_DIRECTMEDIA_STATIC_ASSERT(offsetof(NDL_DIRECTVIDEO_DATA_INFO_T, sour
                                   "DirectMedia video source offset");
 BACKEND_NDL_DIRECTMEDIA_STATIC_ASSERT(sizeof(NDL_DIRECTAUDIO_PCM_INFO_T) == 16,
                                   "DirectEffect PCM ABI size");
+BACKEND_NDL_DIRECTMEDIA_STATIC_ASSERT(offsetof(NDL_DIRECTAUDIO_OPUS_INFO_T, channels) == 0,
+                                  "DirectMedia Opus channels offset");
+BACKEND_NDL_DIRECTMEDIA_STATIC_ASSERT(offsetof(NDL_DIRECTAUDIO_OPUS_INFO_T, sampleRate) == 8,
+                                  "DirectMedia Opus sample rate offset");
+BACKEND_NDL_DIRECTMEDIA_STATIC_ASSERT(offsetof(NDL_DIRECTAUDIO_OPUS_INFO_T, streamHeader) == 16,
+                                  "DirectMedia Opus stream header offset");
 BACKEND_NDL_DIRECTMEDIA_STATIC_ASSERT(offsetof(NDL_DIRECTAUDIO_PCM_INFO_T, format) == 0,
                                   "DirectEffect PCM format offset");
 BACKEND_NDL_DIRECTMEDIA_STATIC_ASSERT(offsetof(NDL_DIRECTAUDIO_PCM_INFO_T, layout) == 4,

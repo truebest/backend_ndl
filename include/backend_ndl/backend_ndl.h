@@ -43,6 +43,12 @@ typedef enum BackendNdlVideoCodec {
     BACKEND_NDL_VIDEO_AV1 = 4
 } BackendNdlVideoCodec;
 
+typedef enum BackendNdlAudioCodec {
+    BACKEND_NDL_AUDIO_NONE = 0,
+    BACKEND_NDL_AUDIO_PCM_S16LE = 1,
+    BACKEND_NDL_AUDIO_OPUS = 2
+} BackendNdlAudioCodec;
+
 typedef enum BackendNdlLogLevel {
     BACKEND_NDL_LOG_DEBUG = 0,
     BACKEND_NDL_LOG_INFO = 1,
@@ -118,6 +124,7 @@ typedef struct BackendNdlConfig {
     int video_frame_drop_threshold;
     bool require_keyframe_after_reload;
     bool guard_audio_overflow;
+    /* Prime configured PCM or Opus after each successful media load. */
     bool prime_pcm_after_load;
 } BackendNdlConfig;
 
@@ -132,6 +139,12 @@ typedef struct BackendNdlPcmInfo {
     /* 1 (mono), 2 (stereo), or 6. Six channels require READY status. */
     uint16_t channels;
 } BackendNdlPcmInfo;
+
+typedef struct BackendNdlAudioInfo {
+    BackendNdlAudioCodec codec;
+    uint32_t sample_rate_hz;
+    uint16_t channels;
+} BackendNdlAudioInfo;
 
 /* Exact field order of the target DirectVideo HDR value parameter. */
 typedef struct BackendNdlHdrInfo {
@@ -182,7 +195,7 @@ const char *backend_ndl_abi_profile_name(BackendNdlAbiProfile profile);
  * transient NOT_READY/NEED_KEYFRAME result. */
 BackendNdlResult backend_ndl_set_media(BackendNdl *ctx,
                                       const BackendNdlVideoInfo *video,
-                                      const BackendNdlPcmInfo *audio);
+                                      const BackendNdlAudioInfo *audio);
 BackendNdlResult backend_ndl_unload(BackendNdl *ctx);
 BackendNdlResult backend_ndl_reload(BackendNdl *ctx);
 

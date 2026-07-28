@@ -62,6 +62,7 @@ typedef int (*BackendNdlLegacyLoadFn)(BackendNdlLegacyMediaInfo *info,
 enum {
     BACKEND_NDL_LEGACY_VIDEO_H264 = 1,
     BACKEND_NDL_LEGACY_AUDIO_PCM = 1,
+    BACKEND_NDL_LEGACY_AUDIO_OPUS = 3,
     BACKEND_NDL_LEGACY_PCM_48K = 1,
     BACKEND_NDL_LEGACY_PCM_44_1K = 2,
     BACKEND_NDL_LEGACY_PCM_32K = 3,
@@ -97,6 +98,15 @@ BACKEND_NDL_LEGACY_STATIC_ASSERT(
 BACKEND_NDL_LEGACY_STATIC_ASSERT(
     offsetof(BackendNdlLegacyMediaInfo, audio.pcm.sample_rate) == 36,
     "legacy DirectMedia PCM rate offset");
+BACKEND_NDL_LEGACY_STATIC_ASSERT(
+    offsetof(BackendNdlLegacyMediaInfo, audio.opus.channels) == 24,
+    "legacy DirectMedia Opus channels offset");
+BACKEND_NDL_LEGACY_STATIC_ASSERT(
+    offsetof(BackendNdlLegacyMediaInfo, audio.opus.sample_rate) == 32,
+    "legacy DirectMedia Opus sample rate offset");
+BACKEND_NDL_LEGACY_STATIC_ASSERT(
+    offsetof(BackendNdlLegacyMediaInfo, audio.opus.stream_header) == 40,
+    "legacy DirectMedia Opus stream header offset");
 #endif
 
 #undef BACKEND_NDL_LEGACY_STATIC_ASSERT

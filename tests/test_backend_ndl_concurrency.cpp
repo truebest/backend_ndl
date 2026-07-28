@@ -85,16 +85,16 @@ static BackendNdlApi fake_api(BackendNdlAbiProfile profile) {
     api.DirectMediaInitCurrent = profile == BACKEND_NDL_ABI_V2_WINDOW_ID_INIT
                                      ? fake_init
                                      : nullptr;
-    api.DirectMediaInitLegacy = profile == BACKEND_NDL_ABI_V2_CALLBACK_INIT
-                                    ? fake_legacy_init
-                                    : nullptr;
+    api.DirectMediaInitCallback = profile == BACKEND_NDL_ABI_V2_CALLBACK_INIT
+                                      ? fake_legacy_init
+                                      : nullptr;
     api.DirectMediaQuit = fake_quit;
     api.DirectMediaLoadCurrent = profile == BACKEND_NDL_ABI_V2_WINDOW_ID_INIT
                                      ? fake_load
                                      : nullptr;
-    api.DirectMediaLoadLegacy = profile == BACKEND_NDL_ABI_V2_CALLBACK_INIT
-                                    ? fake_legacy_load
-                                    : nullptr;
+    api.DirectMediaLoadCallback = profile == BACKEND_NDL_ABI_V2_CALLBACK_INIT
+                                      ? fake_legacy_load
+                                      : nullptr;
     api.DirectMediaUnload = fake_unload;
     api.DirectAudioPlay = fake_audio;
     api.DirectAudioGetAvailableBufferSize = fake_available;
@@ -146,7 +146,7 @@ static BackendNdl *open_backend(bool keyframe_gate, BackendNdlAbiProfile profile
     BackendNdlApi api = fake_api(profile);
     BackendNdl *ctx = backend_ndl_open_with_api(&config, profile, &api);
     BackendNdlVideoInfo video = {BACKEND_NDL_VIDEO_H264, 1920, 1080};
-    BackendNdlPcmInfo audio = {48000, 2};
+    BackendNdlAudioInfo audio = {BACKEND_NDL_AUDIO_PCM_S16LE, 48000, 2};
     if (!ctx || backend_ndl_set_media(ctx, &video, &audio) != BACKEND_NDL_OK) {
         backend_ndl_close(ctx);
         return nullptr;

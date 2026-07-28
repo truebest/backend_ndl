@@ -1,0 +1,84 @@
+function(run_checked)
+  execute_process(
+    COMMAND ${ARGV}
+    RESULT_VARIABLE result
+    OUTPUT_VARIABLE stdout
+    ERROR_VARIABLE stderr
+  )
+  if(NOT result EQUAL 0)
+    string(JOIN " " command ${ARGV})
+    message(FATAL_ERROR
+      "Command failed (${result}): ${command}\n"
+      "stdout:\n${stdout}\n"
+      "stderr:\n${stderr}"
+    )
+  endif()
+endfunction()
+
+set(work_dir "@CMAKE_CURRENT_BINARY_DIR@/install-consumer")
+if(TEST_CONFIG)
+  string(MAKE_C_IDENTIFIER "${TEST_CONFIG}" config_suffix)
+  string(TOLOWER "${config_suffix}" config_suffix)
+  string(APPEND work_dir "-${config_suffix}")
+endif()
+set(install_prefix "${work_dir}/prefix")
+set(consumer_build_dir "${work_dir}/build")
+
+file(REMOVE_RECURSE "${work_dir}")
+
+set(config_args)
+set(ctest_config_args)
+if(TEST_CONFIG)
+  list(APPEND config_args --config "${TEST_CONFIG}")
+  list(APPEND ctest_config_args -C "${TEST_CONFIG}")
+endif()
+
+run_checked(
+  "@CMAKE_COMMAND@" --install "@CMAKE_BINARY_DIR@"
+  ${config_args}
+  --prefix "${install_prefix}"
+)
+
+set(configure_command
+  "@CMAKE_COMMAND@"
+  -S "@CMAKE_CURRENT_SOURCE_DIR@/tests/install-consumer"
+  -B "${consumer_build_dir}"
+  -G "@CMAKE_GENERATOR@"
+  "-Dbackend_ndl_DIR=${install_prefix}/@CMAKE_INSTALL_LIBDIR@/cmake/backend_ndl"
+  "-DCMAKE_C_COMPILER=@CMAKE_C_COMPILER@"
+  "-DCMAKE_C_FLAGS=@CMAKE_C_FLAGS@"
+  "-DCMAKE_C_FLAGS_DEBUG=@CMAKE_C_FLAGS_DEBUG@"
+  "-DCMAKE_C_FLAGS_MINSIZEREL=@CMAKE_C_FLAGS_MINSIZEREL@"
+  "-DCMAKE_C_FLAGS_RELEASE=@CMAKE_C_FLAGS_RELEASE@"
+  "-DCMAKE_C_FLAGS_RELWITHDEBINFO=@CMAKE_C_FLAGS_RELWITHDEBINFO@"
+  "-DCMAKE_EXE_LINKER_FLAGS=@CMAKE_EXE_LINKER_FLAGS@"
+  "-DCMAKE_EXE_LINKER_FLAGS_DEBUG=@CMAKE_EXE_LINKER_FLAGS_DEBUG@"
+  "-DCMAKE_EXE_LINKER_FLAGS_MINSIZEREL=@CMAKE_EXE_LINKER_FLAGS_MINSIZEREL@"
+  "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=@CMAKE_EXE_LINKER_FLAGS_RELEASE@"
+  "-DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO=@CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO@"
+)
+if(NOT "@CMAKE_MAKE_PROGRAM@" STREQUAL "")
+  list(APPEND configure_command "-DCMAKE_MAKE_PROGRAM=@CMAKE_MAKE_PROGRAM@")
+endif()
+if(NOT "@CMAKE_GENERATOR_PLATFORM@" STREQUAL "")
+  list(APPEND configure_command -A "@CMAKE_GENERATOR_PLATFORM@")
+endif()
+if(NOT "@CMAKE_GENERATOR_TOOLSET@" STREQUAL "")
+  list(APPEND configure_command -T "@CMAKE_GENERATOR_TOOLSET@")
+endif()
+if(NOT "@CMAKE_BUILD_TYPE@" STREQUAL "")
+  list(APPEND configure_command "-DCMAKE_BUILD_TYPE=@CMAKE_BUILD_TYPE@")
+endif()
+run_checked(${configure_command})
+
+run_checked(
+  "@CMAKE_COMMAND@" --build "${consumer_build_dir}"
+  ${config_args}
+)
+
+run_checked(
+  "@CMAKE_COMMAND@" -E chdir "${consumer_build_dir}"
+  "@CMAKE_CTEST_COMMAND@"
+  ${ctest_config_args}
+  --output-on-failure
+)

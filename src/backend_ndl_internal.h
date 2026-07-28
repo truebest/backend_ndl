@@ -4,8 +4,6 @@
 
 #include "backend_ndl_api.h"
 
-#if defined(BACKEND_NDL_ENABLED) && BACKEND_NDL_ENABLED
-
 #include <pthread.h>
 #include <stdatomic.h>
 
@@ -19,6 +17,15 @@
 #define BACKEND_NDL_FEED_FLAG_MASK UINT64_C(7)
 #define BACKEND_NDL_FEED_GENERATION_SHIFT 3
 
+typedef struct BackendNdlMediaConfig {
+    bool has_video;
+    BackendNdlVideoInfo video;
+    bool has_audio;
+    BackendNdlAudioInfo audio;
+    bool has_video_hdr;
+    BackendNdlHdrInfo video_hdr;
+} BackendNdlMediaConfig;
+
 struct BackendNdl {
     /* Control plane only. FeedAudio/FeedVideo must never acquire this mutex. */
     pthread_mutex_t lifecycle_lock;
@@ -30,6 +37,7 @@ struct BackendNdl {
     unsigned int webos_sdk_major;
 
     void *dl_handle;
+    bool owns_dl_handle;
     BackendNdlApi api;
     BackendNdlAbiProfile abi_profile;
     BackendNdlCapabilities capabilities;
@@ -38,18 +46,13 @@ struct BackendNdl {
     bool media_loaded;
     uint64_t reload_generation;
 
-    bool has_video;
-    BackendNdlVideoInfo video;
-    bool has_audio;
-    BackendNdlPcmInfo pcm;
+    BackendNdlMediaConfig media;
 
     bool has_video_area;
     int video_left;
     int video_top;
     int video_width;
     int video_height;
-    bool has_video_hdr;
-    BackendNdlHdrInfo video_hdr;
 
     bool effect_loaded;
     BackendNdlPcmInfo effect_pcm;
@@ -67,7 +70,7 @@ struct BackendNdl {
 
 typedef union BackendNdlMediaInfo {
     NDL_DIRECTMEDIA_DATA_INFO_T current;
-    BackendNdlLegacyMediaInfo legacy;
+    BackendNdlLegacyMediaInfo callback;
 } BackendNdlMediaInfo;
 
 extern pthread_mutex_t g_backend_ndl_registry_lock;
@@ -92,16 +95,17 @@ const char *backend_ndl_pcm_channel_mode(uint16_t channels);
 int backend_ndl_pcm_sample_rate(BackendNdlAbiProfile profile, uint32_t hz);
 BackendNdlResult backend_ndl_fill_pcm_info(const BackendNdlPcmInfo *pcm,
                                            NDL_DIRECTAUDIO_PCM_INFO_T *out);
-BackendNdlResult backend_ndl_audio_fill_media_info_locked(BackendNdl *ctx,
-                                                          BackendNdlMediaInfo *out);
-BackendNdlResult backend_ndl_video_fill_media_info_locked(BackendNdl *ctx,
-                                                          BackendNdlMediaInfo *out);
-void backend_ndl_audio_after_load_locked(BackendNdl *ctx);
+BackendNdlResult backend_ndl_audio_fill_media_info(BackendNdlAbiProfile profile,
+                                                   const BackendNdlAudioInfo *audio,
+                                                   BackendNdlMediaInfo *out);
+BackendNdlResult backend_ndl_video_fill_media_info(BackendNdlAbiProfile profile,
+                                                   const BackendNdlVideoInfo *video,
+                                                   BackendNdlMediaInfo *out);
+BackendNdlResult backend_ndl_audio_after_load_locked(BackendNdl *ctx);
 void backend_ndl_video_after_load_locked(BackendNdl *ctx);
+BackendNdlResult backend_ndl_effect_unload_locked(BackendNdl *ctx);
 void backend_ndl_audio_register_capability_callback(BackendNdl *ctx);
 BackendNdlMultichannelStatus backend_ndl_multichannel_from_query(int value);
 BackendNdlMultichannelStatus backend_ndl_multichannel_from_callback(int value);
-
-#endif
 
 #endif

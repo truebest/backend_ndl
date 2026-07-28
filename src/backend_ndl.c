@@ -13,9 +13,7 @@
 #include <string.h>
 #include <time.h>
 
-#if defined(BACKEND_NDL_ENABLED) && BACKEND_NDL_ENABLED
 #include <dlfcn.h>
-#endif
 
 #define BACKEND_NDL_ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -41,7 +39,6 @@ const char *backend_ndl_abi_profile_name(BackendNdlAbiProfile profile) {
     }
 }
 
-#if defined(BACKEND_NDL_ENABLED) && BACKEND_NDL_ENABLED
 static unsigned int backend_ndl_sdk_major(const char *version) {
     if (!version) {
         return 0;
@@ -66,7 +63,6 @@ static unsigned int backend_ndl_sdk_major(const char *version) {
     }
     return value;
 }
-#endif
 
 const char *backend_ndl_result_name(BackendNdlResult result) {
     switch (result) {
@@ -142,10 +138,16 @@ static void backend_ndl_log_config(const BackendNdlConfig *config,
     va_end(args);
 }
 
-#if defined(BACKEND_NDL_ENABLED) && BACKEND_NDL_ENABLED
-
 pthread_mutex_t g_backend_ndl_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 BackendNdl *g_backend_ndl_active = NULL;
+
+#if defined(BACKEND_NDL_TESTING) && BACKEND_NDL_TESTING
+static bool g_backend_ndl_test_force_process_symbols;
+
+void backend_ndl_test_force_process_symbols(bool enabled) {
+    g_backend_ndl_test_force_process_symbols = enabled;
+}
+#endif
 
 /* Unload/Quit cached for backend_ndl_emergency_release(): written on the
  * open/close control path, consumed lock-free from fatal-signal context where
@@ -273,10 +275,10 @@ static bool backend_ndl_resolve_api(BackendNdl *ctx) {
             (__typeof__(ctx->api.DirectMediaLoadCurrent))load_symbol;
     } else {
         ctx->abi_profile = BACKEND_NDL_ABI_V2_CALLBACK_INIT;
-        ctx->api.DirectMediaInitLegacy =
-            (__typeof__(ctx->api.DirectMediaInitLegacy))init_symbol;
-        ctx->api.DirectMediaLoadLegacy =
-            (__typeof__(ctx->api.DirectMediaLoadLegacy))load_symbol;
+        ctx->api.DirectMediaInitCallback =
+            (__typeof__(ctx->api.DirectMediaInitCallback))init_symbol;
+        ctx->api.DirectMediaLoadCallback =
+            (__typeof__(ctx->api.DirectMediaLoadCallback))load_symbol;
     }
 
     OPT(DirectMediaSetAppState);
@@ -297,10 +299,6 @@ static bool backend_ndl_resolve_api(BackendNdl *ctx) {
         OPT(DirectEffectPlay);
         OPT(DirectEffectGetAvailableBufferSize);
     }
-    OPT(DirectMedia_DL_Initialize);
-    OPT(DirectMedia_DL_Finalize);
-    OPT(DirectMedia_DL_IsInitialized);
-
 #undef REQ
 #undef OPT
     BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO, "detected DirectMedia ABI profile: %s",
@@ -354,22 +352,41 @@ static bool backend_ndl_open_library(BackendNdl *ctx) {
                             ctx->config.library_path, dlerror());
             return false;
         }
+        ctx->owns_dl_handle = true;
         BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO, "loaded NDL library: %s",
                         ctx->config.library_path);
         return true;
     }
 
-    for (size_t i = 0; i < BACKEND_NDL_ARRAY_LEN(candidates); i++) {
-        ctx->dl_handle = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
-        if (ctx->dl_handle) {
-            BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO, "loaded NDL library: %s", candidates[i]);
-            return true;
+    bool try_sonames = true;
+#if defined(BACKEND_NDL_TESTING) && BACKEND_NDL_TESTING
+    try_sonames = !g_backend_ndl_test_force_process_symbols;
+#endif
+    if (try_sonames) {
+        for (size_t i = 0; i < BACKEND_NDL_ARRAY_LEN(candidates); i++) {
+            ctx->dl_handle = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
+            if (ctx->dl_handle) {
+                ctx->owns_dl_handle = true;
+                BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO,
+                                "loaded NDL library: %s", candidates[i]);
+                return true;
+            }
+            BACKEND_NDL_DEBUG_LOG(ctx, "dlopen(%s) failed: %s", candidates[i],
+                                  dlerror());
         }
-        BACKEND_NDL_DEBUG_LOG(ctx, "dlopen(%s) failed: %s", candidates[i], dlerror());
     }
 
-    BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_ERROR,
-                    "could not load a DirectMedia facade from known sonames");
+    ctx->dl_handle = RTLD_DEFAULT;
+    ctx->owns_dl_handle = false;
+    if (backend_ndl_sym(ctx, ctx->dl_handle, "NDL_DirectMediaGetError", false)) {
+        BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO,
+                        "using DirectMedia facade from process-global symbols");
+        return true;
+    }
+    ctx->dl_handle = NULL;
+    BACKEND_NDL_LOG(
+        ctx, BACKEND_NDL_LOG_ERROR,
+        "could not find a DirectMedia facade in known sonames or process-global symbols");
     return false;
 }
 
@@ -400,36 +417,60 @@ static void backend_ndl_load_callback(int type, long long number, const char *te
     pthread_mutex_unlock(&g_backend_ndl_registry_lock);
 }
 
-static uint64_t backend_ndl_begin_generation_locked(BackendNdl *ctx) {
+static uint64_t backend_ndl_begin_generation_locked(BackendNdl *ctx,
+                                                    uint64_t *previous_state) {
     const uint64_t max_generation = UINT64_MAX >> BACKEND_NDL_FEED_GENERATION_SHIFT;
-    ctx->reload_generation = ctx->reload_generation >= max_generation ? 1 : ctx->reload_generation + 1;
+    ctx->reload_generation =
+        ctx->reload_generation >= max_generation ? 1 : ctx->reload_generation + 1;
     uint64_t state = ctx->reload_generation << BACKEND_NDL_FEED_GENERATION_SHIFT;
-    atomic_store_explicit(&ctx->feed_state, state, memory_order_release);
+    uint64_t previous =
+        atomic_exchange_explicit(&ctx->feed_state, state, memory_order_acq_rel);
+    if (previous_state) {
+        *previous_state = previous;
+    }
     return state;
 }
 
-static BackendNdlResult backend_ndl_build_media_info_locked(BackendNdl *ctx,
-                                                            BackendNdlMediaInfo *out) {
-    if (!ctx->has_video && !ctx->has_audio) {
+static bool backend_ndl_media_has_tracks(const BackendNdlMediaConfig *media) {
+    return media->has_video || media->has_audio;
+}
+
+static BackendNdlResult backend_ndl_build_media_info(
+    const BackendNdl *ctx,
+    const BackendNdlMediaConfig *media,
+    BackendNdlMediaInfo *out) {
+    if (!backend_ndl_media_has_tracks(media)) {
         return BACKEND_NDL_NOT_READY;
     }
     memset(out, 0, sizeof(*out));
-    if (ctx->has_video) {
-        BackendNdlResult result = backend_ndl_video_fill_media_info_locked(ctx, out);
+    if (media->has_video) {
+        BackendNdlResult result =
+            backend_ndl_video_fill_media_info(ctx->abi_profile, &media->video, out);
         if (result != BACKEND_NDL_OK) return result;
     }
-    if (ctx->has_audio) {
-        BackendNdlResult result = backend_ndl_audio_fill_media_info_locked(ctx, out);
+    if (media->has_audio) {
+        BackendNdlResult result =
+            backend_ndl_audio_fill_media_info(ctx->abi_profile, &media->audio, out);
         if (result != BACKEND_NDL_OK) return result;
     }
     return BACKEND_NDL_OK;
+}
+
+static uint64_t backend_ndl_loaded_feed_flags(const BackendNdl *ctx,
+                                              const BackendNdlMediaConfig *media) {
+    uint64_t flags = 0;
+    if (media->has_video) flags |= BACKEND_NDL_FEED_VIDEO_READY;
+    if (media->has_audio) flags |= BACKEND_NDL_FEED_AUDIO_READY;
+    if (media->has_video && ctx->config.require_keyframe_after_reload) {
+        flags |= BACKEND_NDL_FEED_NEED_KEYFRAME;
+    }
+    return flags;
 }
 
 static BackendNdlResult backend_ndl_unload_locked(BackendNdl *ctx) {
     if (!ctx->media_loaded) {
         return BACKEND_NDL_OK;
     }
-    ctx->media_loaded = false;
     int rc = ctx->api.DirectMediaUnload();
     if (rc != 0) {
         BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_ERROR,
@@ -437,74 +478,162 @@ static BackendNdlResult backend_ndl_unload_locked(BackendNdl *ctx) {
                         backend_ndl_last_error(ctx));
         return BACKEND_NDL_ERROR;
     }
+    ctx->media_loaded = false;
+    atomic_store_explicit(&ctx->loaded_start_ms, 0, memory_order_release);
     BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO, "media unloaded");
     return BACKEND_NDL_OK;
 }
 
-static BackendNdlResult backend_ndl_reload_locked(BackendNdl *ctx) {
+static BackendNdlResult backend_ndl_load_media_info_locked(
+    BackendNdl *ctx,
+    BackendNdlMediaInfo *info,
+    const char *operation) {
+    int rc;
+    if (ctx->abi_profile == BACKEND_NDL_ABI_V2_WINDOW_ID_INIT) {
+        rc = ctx->api.DirectMediaLoadCurrent(&info->current, backend_ndl_load_callback);
+    } else {
+        rc = ctx->api.DirectMediaLoadCallback(&info->callback, backend_ndl_load_callback);
+    }
+    if (rc != 0) {
+        BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_ERROR,
+                        "NDL_DirectMediaLoad (%s) failed rc=%d error=%s", operation, rc,
+                        backend_ndl_last_error(ctx));
+        return BACKEND_NDL_ERROR;
+    }
+    return BACKEND_NDL_OK;
+}
+
+static BackendNdlResult backend_ndl_publish_loaded_locked(
+    BackendNdl *ctx,
+    const BackendNdlMediaConfig *media,
+    uint64_t transition_state) {
+    ctx->media = *media;
+    ctx->media_loaded = true;
+    atomic_store_explicit(&ctx->loaded_start_ms, backend_ndl_monotonic_ms(),
+                          memory_order_release);
+    backend_ndl_video_after_load_locked(ctx);
+    BackendNdlResult audio_result = backend_ndl_audio_after_load_locked(ctx);
+    if (audio_result != BACKEND_NDL_OK) {
+        BackendNdlResult unload_result = backend_ndl_unload_locked(ctx);
+        if (unload_result != BACKEND_NDL_OK) {
+            BACKEND_NDL_LOG(
+                ctx, BACKEND_NDL_LOG_ERROR,
+                "could not unload media after post-load setup failed: %s",
+                backend_ndl_result_name(unload_result));
+        }
+        return audio_result;
+    }
+
+    uint64_t flags = backend_ndl_loaded_feed_flags(ctx, media);
+    atomic_store_explicit(&ctx->feed_state, transition_state | flags, memory_order_release);
+    BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO,
+                    "media loaded: generation=%llu video=%s audio=%s",
+                    (unsigned long long)ctx->reload_generation,
+                    media->has_video ? "yes" : "no", media->has_audio ? "yes" : "no");
+    return BACKEND_NDL_OK;
+}
+
+static BackendNdlResult backend_ndl_replace_media_locked(
+    BackendNdl *ctx,
+    const BackendNdlMediaConfig *next) {
     if (!ctx->ndl_initialized) {
         return BACKEND_NDL_NOT_READY;
     }
 
-    uint64_t transition_state = backend_ndl_begin_generation_locked(ctx);
+    BackendNdlMediaInfo next_info;
+    if (backend_ndl_media_has_tracks(next)) {
+        BackendNdlResult build_result = backend_ndl_build_media_info(ctx, next, &next_info);
+        if (build_result != BACKEND_NDL_OK) {
+            return build_result;
+        }
+    }
+
+    BackendNdlMediaConfig previous = ctx->media;
+    bool previous_loaded = ctx->media_loaded;
+    BackendNdlMediaInfo previous_info;
+    if (previous_loaded) {
+        BackendNdlResult build_result =
+            backend_ndl_build_media_info(ctx, &previous, &previous_info);
+        if (build_result != BACKEND_NDL_OK) {
+            BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_ERROR,
+                            "stored media configuration is invalid: %s",
+                            backend_ndl_result_name(build_result));
+            return build_result;
+        }
+    }
+
+    uint64_t previous_state = 0;
+    uint64_t transition_state =
+        backend_ndl_begin_generation_locked(ctx, &previous_state);
     BackendNdlResult unload_result = backend_ndl_unload_locked(ctx);
     if (unload_result != BACKEND_NDL_OK) {
+        uint64_t previous_flags = previous_state & BACKEND_NDL_FEED_FLAG_MASK;
+        atomic_store_explicit(&ctx->feed_state, transition_state | previous_flags,
+                              memory_order_release);
         return unload_result;
     }
-    if (!ctx->has_video && !ctx->has_audio) {
+
+    if (!backend_ndl_media_has_tracks(next)) {
+        ctx->media = *next;
         return BACKEND_NDL_OK;
     }
 
-    BackendNdlMediaInfo info;
-    BackendNdlResult build_result = backend_ndl_build_media_info_locked(ctx, &info);
-    if (build_result != BACKEND_NDL_OK) {
-        return build_result;
+    BackendNdlResult load_result =
+        backend_ndl_load_media_info_locked(ctx, &next_info, "reconfigure");
+    if (load_result == BACKEND_NDL_OK) {
+        load_result =
+            backend_ndl_publish_loaded_locked(ctx, next, transition_state);
+        if (load_result == BACKEND_NDL_OK) {
+            return BACKEND_NDL_OK;
+        }
     }
-    int rc;
-    if (ctx->abi_profile == BACKEND_NDL_ABI_V2_WINDOW_ID_INIT) {
-        rc = ctx->api.DirectMediaLoadCurrent(&info.current, backend_ndl_load_callback);
+
+    if (!ctx->media_loaded) {
+        ctx->media = previous;
+    }
+    if (previous_loaded && !ctx->media_loaded) {
+        BackendNdlResult restore_result =
+            backend_ndl_load_media_info_locked(ctx, &previous_info, "restore");
+        if (restore_result == BACKEND_NDL_OK) {
+            restore_result =
+                backend_ndl_publish_loaded_locked(ctx, &previous, transition_state);
+            if (restore_result == BACKEND_NDL_OK) {
+                BACKEND_NDL_LOG(
+                    ctx, BACKEND_NDL_LOG_INFO,
+                    "restored previous media configuration after failed reconfigure");
+            }
+        }
+        if (restore_result != BACKEND_NDL_OK) {
+            ctx->media = previous;
+            atomic_store_explicit(&ctx->feed_state, transition_state,
+                                  memory_order_release);
+            BACKEND_NDL_LOG(
+                ctx, BACKEND_NDL_LOG_ERROR,
+                "could not restore previous media configuration after failed reconfigure: %s",
+                backend_ndl_result_name(restore_result));
+        }
+    } else if (ctx->media_loaded) {
+        atomic_store_explicit(&ctx->feed_state, transition_state,
+                              memory_order_release);
+        BACKEND_NDL_LOG(
+            ctx, BACKEND_NDL_LOG_ERROR,
+            "failed replacement remains loaded but disabled after teardown failure");
     } else {
-        rc = ctx->api.DirectMediaLoadLegacy(&info.legacy, backend_ndl_load_callback);
+        atomic_store_explicit(&ctx->feed_state, transition_state,
+                              memory_order_release);
     }
-    if (rc != 0) {
-        BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_ERROR,
-                        "NDL_DirectMediaLoad failed rc=%d error=%s", rc,
-                        backend_ndl_last_error(ctx));
-        return BACKEND_NDL_ERROR;
-    }
-
-    ctx->media_loaded = true;
-    atomic_store_explicit(&ctx->loaded_start_ms, backend_ndl_monotonic_ms(), memory_order_release);
-    backend_ndl_video_after_load_locked(ctx);
-    backend_ndl_audio_after_load_locked(ctx);
-
-    uint64_t flags = 0;
-    if (ctx->has_video) flags |= BACKEND_NDL_FEED_VIDEO_READY;
-    if (ctx->has_audio) flags |= BACKEND_NDL_FEED_AUDIO_READY;
-    if (ctx->has_video && ctx->config.require_keyframe_after_reload) {
-        flags |= BACKEND_NDL_FEED_NEED_KEYFRAME;
-    }
-    atomic_store_explicit(&ctx->feed_state, transition_state | flags, memory_order_release);
-
-    BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO, "media loaded: generation=%llu video=%s audio=%s",
-                    (unsigned long long)ctx->reload_generation, ctx->has_video ? "yes" : "no",
-                    ctx->has_audio ? "yes" : "no");
-    return BACKEND_NDL_OK;
+    return load_result;
 }
 
-static void backend_ndl_restore_after_failed_reload_locked(BackendNdl *ctx) {
-    if (ctx->media_loaded || (!ctx->has_video && !ctx->has_audio)) {
-        return;
-    }
-    BackendNdlResult result = backend_ndl_reload_locked(ctx);
-    if (result == BACKEND_NDL_OK) {
-        BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO,
-                        "restored previous media configuration after failed reconfigure");
-    } else {
-        BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_ERROR,
-                        "could not restore previous media configuration after failed reconfigure: %s",
-                        backend_ndl_result_name(result));
-    }
+static bool backend_ndl_video_info_equal(const BackendNdlVideoInfo *left,
+                                         const BackendNdlVideoInfo *right) {
+    return left->codec == right->codec && left->width == right->width &&
+           left->height == right->height;
+}
+
+static BackendNdlResult backend_ndl_reload_locked(BackendNdl *ctx) {
+    BackendNdlMediaConfig media = ctx->media;
+    return backend_ndl_replace_media_locked(ctx, &media);
 }
 
 static bool backend_ndl_api_has_required_profile(const BackendNdlApi *api,
@@ -518,8 +647,8 @@ static bool backend_ndl_api_has_required_profile(const BackendNdlApi *api,
                api->DirectMediaLoadCurrent;
     }
     if (profile == BACKEND_NDL_ABI_V2_CALLBACK_INIT) {
-        return !api->DirectMediaSetWindowId && api->DirectMediaInitLegacy &&
-               api->DirectMediaLoadLegacy;
+        return !api->DirectMediaSetWindowId && api->DirectMediaInitCallback &&
+               api->DirectMediaLoadCallback;
     }
     return false;
 }
@@ -637,7 +766,7 @@ static BackendNdl *backend_ndl_open_common(const BackendNdlConfig *config,
     if (ctx->abi_profile == BACKEND_NDL_ABI_V2_WINDOW_ID_INIT) {
         rc = ctx->api.DirectMediaInitCurrent(ctx->app_id);
     } else {
-        rc = ctx->api.DirectMediaInitLegacy(ctx->app_id, NULL);
+        rc = ctx->api.DirectMediaInitCallback(ctx->app_id, NULL);
     }
     if (rc != 0) {
         BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_ERROR,
@@ -691,7 +820,7 @@ void backend_ndl_close(BackendNdl *ctx) {
     pthread_mutex_lock(&ctx->lifecycle_lock);
     bool facade_owned = true;
     if (ctx->ndl_initialized) {
-        (void)backend_ndl_begin_generation_locked(ctx);
+        (void)backend_ndl_begin_generation_locked(ctx, NULL);
         /* Take facade ownership through the same claim the emergency release
          * uses. Losing it means a dying-process handler is (or was) inside
          * Unload/Quit: skip every further facade call and keep the library
@@ -708,10 +837,7 @@ void backend_ndl_close(BackendNdl *ctx) {
             ctx->ndl_initialized = false;
         }
     }
-    if (ctx->effect_loaded && ctx->api.DirectEffectUnload) {
-        (void)ctx->api.DirectEffectUnload();
-        ctx->effect_loaded = false;
-    }
+    (void)backend_ndl_effect_unload_locked(ctx);
     if (ctx->media_loaded) (void)backend_ndl_unload_locked(ctx);
     if (ctx->ndl_initialized) {
         int rc = ctx->api.DirectMediaQuit();
@@ -726,7 +852,7 @@ void backend_ndl_close(BackendNdl *ctx) {
 
     /* With the claim lost the handle leaks deliberately: the process is dying
      * and the claimant may still be executing facade code. */
-    if (ctx->dl_handle && facade_owned) dlclose(ctx->dl_handle);
+    if (ctx->owns_dl_handle && facade_owned) dlclose(ctx->dl_handle);
     free(ctx->webos_sdk_version);
     free(ctx->window_id);
     free(ctx->app_id);
@@ -744,7 +870,7 @@ BackendNdlAbiProfile backend_ndl_get_abi_profile(const BackendNdl *ctx) {
 
 BackendNdlResult backend_ndl_set_media(BackendNdl *ctx,
                                       const BackendNdlVideoInfo *video,
-                                      const BackendNdlPcmInfo *audio) {
+                                      const BackendNdlAudioInfo *audio) {
     if (!ctx) return BACKEND_NDL_INVALID_ARGUMENT;
     if (video) {
         if (!ctx->api.DirectVideoPlay) return BACKEND_NDL_UNAVAILABLE;
@@ -762,50 +888,42 @@ BackendNdlResult backend_ndl_set_media(BackendNdl *ctx,
     }
     if (audio) {
         if (!ctx->api.DirectAudioPlay) return BACKEND_NDL_UNAVAILABLE;
-        if (audio->sample_rate_hz == 0 || audio->channels == 0) {
+        if (audio->codec == BACKEND_NDL_AUDIO_NONE ||
+            audio->sample_rate_hz == 0 || audio->channels == 0) {
             return BACKEND_NDL_INVALID_ARGUMENT;
         }
-        if (!backend_ndl_pcm_channel_mode(audio->channels) ||
-            !backend_ndl_pcm_sample_rate_supported(audio->sample_rate_hz)) {
+        if (audio->codec != BACKEND_NDL_AUDIO_PCM_S16LE &&
+            audio->codec != BACKEND_NDL_AUDIO_OPUS) {
             return BACKEND_NDL_UNSUPPORTED;
         }
-        if (audio->channels == 6 &&
-            atomic_load_explicit(&ctx->multichannel_status, memory_order_acquire) !=
-                BACKEND_NDL_MULTICHANNEL_READY) {
+        if (audio->codec == BACKEND_NDL_AUDIO_PCM_S16LE) {
+            if (!backend_ndl_pcm_channel_mode(audio->channels) ||
+                !backend_ndl_pcm_sample_rate_supported(audio->sample_rate_hz)) {
+                return BACKEND_NDL_UNSUPPORTED;
+            }
+            if (audio->channels == 6 &&
+                atomic_load_explicit(&ctx->multichannel_status, memory_order_acquire) !=
+                    BACKEND_NDL_MULTICHANNEL_READY) {
+                return BACKEND_NDL_UNSUPPORTED;
+            }
+        } else if (audio->channels != 2 || audio->sample_rate_hz != 48000) {
             return BACKEND_NDL_UNSUPPORTED;
         }
     }
+
+    BackendNdlMediaConfig next = {0};
+    next.has_video = video != NULL;
+    next.has_audio = audio != NULL;
+    if (video) next.video = *video;
+    if (audio) next.audio = *audio;
 
     pthread_mutex_lock(&ctx->lifecycle_lock);
-    BackendNdlVideoInfo saved_video = ctx->video;
-    BackendNdlPcmInfo saved_audio = ctx->pcm;
-    bool saved_has_video = ctx->has_video;
-    bool saved_has_audio = ctx->has_audio;
-    bool saved_has_hdr = ctx->has_video_hdr;
-    BackendNdlHdrInfo saved_hdr = ctx->video_hdr;
-
-    bool same_video = video && ctx->has_video && memcmp(video, &ctx->video, sizeof(*video)) == 0;
-    memset(&ctx->video, 0, sizeof(ctx->video));
-    memset(&ctx->pcm, 0, sizeof(ctx->pcm));
-    ctx->has_video = video != NULL;
-    ctx->has_audio = audio != NULL;
-    if (video) ctx->video = *video;
-    if (audio) ctx->pcm = *audio;
-    if (!same_video) {
-        ctx->has_video_hdr = false;
-        memset(&ctx->video_hdr, 0, sizeof(ctx->video_hdr));
+    if (video && ctx->media.has_video &&
+        backend_ndl_video_info_equal(video, &ctx->media.video)) {
+        next.has_video_hdr = ctx->media.has_video_hdr;
+        next.video_hdr = ctx->media.video_hdr;
     }
-
-    BackendNdlResult result = backend_ndl_reload_locked(ctx);
-    if (result != BACKEND_NDL_OK) {
-        ctx->video = saved_video;
-        ctx->pcm = saved_audio;
-        ctx->has_video = saved_has_video;
-        ctx->has_audio = saved_has_audio;
-        ctx->has_video_hdr = saved_has_hdr;
-        ctx->video_hdr = saved_hdr;
-        backend_ndl_restore_after_failed_reload_locked(ctx);
-    }
+    BackendNdlResult result = backend_ndl_replace_media_locked(ctx, &next);
     pthread_mutex_unlock(&ctx->lifecycle_lock);
     return result;
 }
@@ -847,31 +965,3 @@ BackendNdlResult backend_ndl_set_foreground(BackendNdl *ctx, bool foreground) {
     pthread_mutex_unlock(&ctx->lifecycle_lock);
     return rc == 0 ? BACKEND_NDL_OK : BACKEND_NDL_ERROR;
 }
-
-#else
-
-BackendNdl *backend_ndl_open(const BackendNdlConfig *config) {
-    backend_ndl_log_config(config, BACKEND_NDL_LOG_WARN,
-                           "built without DirectMedia platform support; backend unavailable");
-    return NULL;
-}
-
-void backend_ndl_close(BackendNdl *ctx) { (void)ctx; }
-bool backend_ndl_emergency_release(void) { return false; }
-BackendNdlCapabilities backend_ndl_get_capabilities(const BackendNdl *ctx) { (void)ctx; return 0; }
-BackendNdlAbiProfile backend_ndl_get_abi_profile(const BackendNdl *ctx) {
-    (void)ctx;
-    return BACKEND_NDL_ABI_UNKNOWN;
-}
-BackendNdlResult backend_ndl_set_media(BackendNdl *ctx, const BackendNdlVideoInfo *video,
-                                      const BackendNdlPcmInfo *audio) {
-    (void)ctx; (void)video; (void)audio; return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_unload(BackendNdl *ctx) { (void)ctx; return BACKEND_NDL_UNAVAILABLE; }
-BackendNdlResult backend_ndl_reload(BackendNdl *ctx) { (void)ctx; return BACKEND_NDL_UNAVAILABLE; }
-long long backend_ndl_media_time_ms(const BackendNdl *ctx) { (void)ctx; return 0; }
-BackendNdlResult backend_ndl_set_foreground(BackendNdl *ctx, bool foreground) {
-    (void)ctx; (void)foreground; return BACKEND_NDL_UNAVAILABLE;
-}
-
-#endif

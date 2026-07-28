@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.19)
 
-set(BACKEND_NDL_VERSION 0.3.0)
+set(BACKEND_NDL_VERSION 0.4.0)
 
 if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
   project(backend_ndl VERSION ${BACKEND_NDL_VERSION} LANGUAGES C)
@@ -12,7 +12,6 @@ endif()
 
 include(GNUInstallDirs)
 
-option(BACKEND_NDL_ENABLE "Compile the webOS DirectMedia runtime implementation" OFF)
 option(BACKEND_NDL_BUILD_TESTS "Build backend_ndl host tests" ${BUILD_TESTING})
 option(BACKEND_NDL_INSTALL "Install backend_ndl development files" ${BACKEND_NDL_TOP_LEVEL})
 option(BACKEND_NDL_ENABLE_TSAN "Run backend_ndl host tests under ThreadSanitizer" OFF)
@@ -83,18 +82,13 @@ target_include_directories(backend_ndl
   PRIVATE src
 )
 
-if(BACKEND_NDL_ENABLE)
-  find_package(Threads REQUIRED)
-  target_compile_definitions(backend_ndl PRIVATE BACKEND_NDL_ENABLED=1)
-  target_link_libraries(backend_ndl PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
-  if(UNIX AND NOT APPLE)
-    target_link_libraries(backend_ndl PRIVATE rt)
-  endif()
+find_package(Threads REQUIRED)
+target_link_libraries(backend_ndl PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+if(UNIX AND NOT APPLE)
+  target_link_libraries(backend_ndl PRIVATE rt)
 endif()
 
 if(BACKEND_NDL_BUILD_TESTS)
-  find_package(Threads REQUIRED)
-
   add_library(backend_ndl_test_support STATIC ${BACKEND_NDL_SOURCES})
   add_library(backend_ndl::test_support ALIAS backend_ndl_test_support)
   set_target_properties(backend_ndl_test_support PROPERTIES
@@ -102,10 +96,7 @@ if(BACKEND_NDL_BUILD_TESTS)
     C_STANDARD_REQUIRED YES
     C_EXTENSIONS YES
   )
-  target_compile_definitions(backend_ndl_test_support PUBLIC
-    BACKEND_NDL_ENABLED=1
-    BACKEND_NDL_TESTING=1
-  )
+  target_compile_definitions(backend_ndl_test_support PUBLIC BACKEND_NDL_TESTING=1)
   target_include_directories(backend_ndl_test_support
     PUBLIC include src
   )
@@ -134,7 +125,6 @@ if(BACKEND_NDL_BUILD_TESTS)
 
     add_executable(test-backend-ndl-abi tests/test_tv_abi_layout.cpp)
     target_compile_definitions(test-backend-ndl-abi PRIVATE
-      BACKEND_NDL_ENABLED=1
       BACKEND_NDL_TESTING=1
     )
     target_include_directories(test-backend-ndl-abi PRIVATE src)
@@ -178,6 +168,15 @@ if(BACKEND_NDL_BUILD_TESTS)
       SOVERSION 1
     )
 
+    add_library(backend_ndl_fake_facade_global SHARED tests/fake_ndl_facade.c)
+    target_include_directories(backend_ndl_fake_facade_global PRIVATE src)
+    set_target_properties(backend_ndl_fake_facade_global PROPERTIES
+      C_STANDARD 11
+      C_STANDARD_REQUIRED YES
+      C_EXTENSIONS YES
+      OUTPUT_NAME backend_ndl_global_fixture
+    )
+
     add_library(backend_ndl_fake_facade_legacy SHARED tests/fake_ndl_facade_legacy.c)
     target_include_directories(backend_ndl_fake_facade_legacy PRIVATE src)
     set_target_properties(backend_ndl_fake_facade_legacy PROPERTIES
@@ -203,12 +202,19 @@ if(BACKEND_NDL_BUILD_TESTS)
     add_executable(test-backend-ndl-resolver tests/test_backend_ndl_resolver.cpp)
     target_compile_definitions(test-backend-ndl-resolver PRIVATE
       BACKEND_NDL_FAKE_FACADE_PATH="$<TARGET_FILE:backend_ndl_fake_facade>"
+      BACKEND_NDL_FAKE_GLOBAL_FACADE_PATH="$<TARGET_FILE:backend_ndl_fake_facade_global>"
       BACKEND_NDL_FAKE_LEGACY_FACADE_PATH="$<TARGET_FILE:backend_ndl_fake_facade_legacy>"
       BACKEND_NDL_FAKE_INCOMPLETE_FACADE_PATH="$<TARGET_FILE:backend_ndl_fake_facade_incomplete>"
     )
     target_link_libraries(test-backend-ndl-resolver PRIVATE
       backend_ndl::test_support
       GTest::gtest_main
+    )
+    add_dependencies(test-backend-ndl-resolver
+      backend_ndl_fake_facade
+      backend_ndl_fake_facade_global
+      backend_ndl_fake_facade_legacy
+      backend_ndl_fake_facade_incomplete
     )
     gtest_discover_tests(test-backend-ndl-resolver
       TEST_PREFIX "backend-ndl-resolver."
@@ -239,7 +245,6 @@ if(BACKEND_NDL_INSTALL)
   include(CMakePackageConfigHelpers)
   install(TARGETS backend_ndl EXPORT backend_ndlTargets
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
   )
   install(DIRECTORY include/backend_ndl DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
   install(FILES LICENSE README.md THIRD_PARTY.md DESTINATION "${CMAKE_INSTALL_DATADIR}/backend_ndl")
@@ -262,5 +267,19 @@ if(BACKEND_NDL_INSTALL)
     "${CMAKE_CURRENT_BINARY_DIR}/backend_ndlConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/backend_ndlConfigVersion.cmake"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/backend_ndl"
+  )
+endif()
+
+if(BACKEND_NDL_TOP_LEVEL AND BACKEND_NDL_BUILD_TESTS AND BACKEND_NDL_INSTALL
+   AND NOT CMAKE_CROSSCOMPILING)
+  configure_file(
+    tests/install-consumer/run.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/test-backend-ndl-install-consumer.cmake"
+    @ONLY
+  )
+  add_test(NAME backend-ndl-install-consumer
+    COMMAND "${CMAKE_COMMAND}"
+      "-DTEST_CONFIG=$<CONFIG>"
+      -P "${CMAKE_CURRENT_BINARY_DIR}/test-backend-ndl-install-consumer.cmake"
   )
 endif()

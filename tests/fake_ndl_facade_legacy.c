@@ -14,7 +14,8 @@ int NDL_DirectMediaSetAppState(int state) { return state == 0 || state == 1 ? 0 
 int NDL_DirectMediaLoad(BackendNdlLegacyMediaInfo *data,
                         BackendNdlLegacyStateCallbackFn callback) {
     if (!data || (data->video.type != 0 && data->video.type != BACKEND_NDL_LEGACY_VIDEO_H264) ||
-        (data->audio.type != 0 && data->audio.type != BACKEND_NDL_LEGACY_AUDIO_PCM)) {
+        (data->audio.type != 0 && data->audio.type != BACKEND_NDL_LEGACY_AUDIO_PCM &&
+         data->audio.type != BACKEND_NDL_LEGACY_AUDIO_OPUS)) {
         return -1;
     }
     g_loaded = true;
@@ -48,7 +49,3 @@ int NDL_DirectVideoGetRenderBufferLength(int *length) {
     return 0;
 }
 int NDL_DirectVideoFlushRenderBuffer(void) { return 0; }
-
-bool NDL_DirectMedia_DL_Initialize(void) { return false; }
-void NDL_DirectMedia_DL_Finalize(void) { }
-bool NDL_DirectMedia_DL_IsInitialized(void) { return false; }

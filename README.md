@@ -1,6 +1,6 @@
 # backend_ndl
 
-`backend_ndl` 0.3 is a standalone C11 wrapper around the process-global webOS
+`backend_ndl` 0.4 is a standalone C11 wrapper around the process-global webOS
 NDL DirectMedia facade. It owns runtime symbol loading, the combined
 audio/video control plane, mutex-free feed paths, optional buffer guards,
 effects, video controls, and firmware callbacks. It has no dependency on
@@ -13,7 +13,6 @@ the wrapper never link or dlopen the implementation directly.
 ## Embedding with CMake
 
 ```cmake
-set(BACKEND_NDL_ENABLE ON)
 set(BACKEND_NDL_BUILD_TESTS OFF)
 set(BACKEND_NDL_INSTALL OFF)
 add_subdirectory(path/to/backend_ndl)
@@ -27,7 +26,9 @@ combined-media layouts. The wrapper therefore needs no NDK headers, libraries,
 compiler, sysroot, or `pkg-config` metadata.
 
 The wrapper resolves every NDL entry point with `dlopen`/`dlsym`; the final
-application therefore has no NDL `DT_NEEDED`.
+application therefore has no NDL `DT_NEEDED`. The runtime implementation is
+always compiled; a missing DirectMedia facade is reported by
+`backend_ndl_open()` at runtime.
 
 Standalone build and install:
 
@@ -79,13 +80,16 @@ TSAN_OPTIONS=halt_on_error=1 \
   `DirectMediaInit(app_id)` profile. Its absence selects the webOS 5+
   `DirectMediaInit(app_id, NULL)` callback profile. `Load` and `Unload` are
   required in both cases; an Init signature is never retried after failure.
-- `window_id` is accepted only by the window-id profile. Legacy mode guarantees
-  H.264 plus interleaved S16LE mono/stereo PCM and uses its own sample-rate map;
-  HDR, effects, multichannel callbacks and newer video codecs are masked.
+- `window_id` is accepted only by the window-id profile. The callback profile
+  guarantees H.264 plus interleaved S16LE mono/stereo PCM and uses its own
+  sample-rate map; HDR, effects, multichannel callbacks and newer video codecs
+  are masked.
 - The facade owns its internal DL lifecycle. The wrapper never calls the
   exported `DirectMedia_DL_Initialize/Finalize` helpers.
 - `backend_ndl_set_media()` replaces both tracks because DirectMedia loads
   audio and video as one pipeline.
+- Media audio uses a tagged `BackendNdlAudioInfo` and supports PCM S16LE or
+  raw Opus packets. The independent DirectEffect API remains PCM-only.
 - `backend_ndl_feed_audio()` and `backend_ndl_feed_video()` acquire no wrapper
   mutex. Audio and video may run concurrently and may cross reload/unload.
 - A C11 atomic generation snapshot keeps readiness, AUTO PTS and the keyframe
@@ -98,8 +102,8 @@ TSAN_OPTIONS=halt_on_error=1 \
   return code is authoritative.
 
 Optional controls are represented by capabilities. Audio and video feed
-symbols are independently optional; unsafe legacy HDR/effect/multichannel
-signatures are never exposed as capabilities.
+symbols are independently optional; unsafe callback-profile
+HDR/effect/multichannel signatures are never exposed as capabilities.
 
 ## ABI audit
 

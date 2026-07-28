@@ -37,16 +37,14 @@ typedef struct FakeNdl {
     int effect_unload_calls;
     int effect_play_calls;
     int effect_available_calls;
-    int dl_init_calls;
-    int dl_finalize_calls;
-    int dl_is_initialized_calls;
 
-    bool dl_initialized;
     bool fail_init;
     bool fail_load;
+    bool fail_unload;
     int fail_load_remaining;
     bool fail_video_play;
     bool fail_audio_play;
+    bool fail_effect_unload;
     bool fail_effect_play;
     bool legacy_init_callback_was_null;
     int audio_available;
@@ -67,6 +65,7 @@ typedef struct FakeNdl {
     int last_threshold;
     long long last_video_pts;
     unsigned int audio_sizes[FAKE_MAX_PLAYS];
+    unsigned char audio_prefix[FAKE_MAX_PLAYS][4];
     long long audio_pts[FAKE_MAX_PLAYS];
     StateCallbackFP media_callback;
     MultiChannelPCMCallbackFP multichannel_callback;
@@ -136,12 +135,18 @@ static int fake_legacy_load(BackendNdlLegacyMediaInfo *data,
     }
     return g_fake.fail_load ? -1 : 0;
 }
-static int fake_unload(void) { g_fake.unload_calls++; return 0; }
+static int fake_unload(void) {
+    g_fake.unload_calls++;
+    return g_fake.fail_unload ? -1 : 0;
+}
 static int fake_audio_play(void *data, unsigned int size, long long pts) {
-    (void)data;
     if (g_fake.audio_play_calls < FAKE_MAX_PLAYS) {
         g_fake.audio_sizes[g_fake.audio_play_calls] = size;
         g_fake.audio_pts[g_fake.audio_play_calls] = pts;
+        if (data && size) {
+            size_t copy = size < 4u ? size : 4u;
+            memcpy(g_fake.audio_prefix[g_fake.audio_play_calls], data, copy);
+        }
     }
     g_fake.audio_play_calls++;
     return g_fake.fail_audio_play ? -1 : 0;
@@ -203,7 +208,10 @@ static int fake_effect_load(NDL_DIRECTAUDIO_PCM_INFO_T *pcm, unsigned int *prefe
     *preferred = g_fake.effect_preferred;
     return 0;
 }
-static int fake_effect_unload(void) { g_fake.effect_unload_calls++; return 0; }
+static int fake_effect_unload(void) {
+    g_fake.effect_unload_calls++;
+    return g_fake.fail_effect_unload ? -1 : 0;
+}
 static int fake_effect_play(void *data, unsigned int size) {
     (void)data;
     (void)size;
@@ -215,13 +223,6 @@ static int fake_effect_available(unsigned int *available) {
     *available = g_fake.effect_available;
     return 0;
 }
-static bool fake_dl_initialize(void) { g_fake.dl_init_calls++; return true; }
-static void fake_dl_finalize(void) { g_fake.dl_finalize_calls++; }
-static bool fake_dl_is_initialized(void) {
-    g_fake.dl_is_initialized_calls++;
-    return g_fake.dl_initialized;
-}
-
 static BackendNdlApi fake_api_full(void) {
     BackendNdlApi api;
     memset(&api, 0, sizeof(api));
@@ -247,9 +248,6 @@ static BackendNdlApi fake_api_full(void) {
     api.DirectEffectUnload = fake_effect_unload;
     api.DirectEffectPlay = fake_effect_play;
     api.DirectEffectGetAvailableBufferSize = fake_effect_available;
-    api.DirectMedia_DL_Initialize = fake_dl_initialize;
-    api.DirectMedia_DL_Finalize = fake_dl_finalize;
-    api.DirectMedia_DL_IsInitialized = fake_dl_is_initialized;
     return api;
 }
 
@@ -258,8 +256,8 @@ static BackendNdlApi fake_api_legacy(void) {
     api.DirectMediaSetWindowId = nullptr;
     api.DirectMediaInitCurrent = nullptr;
     api.DirectMediaLoadCurrent = nullptr;
-    api.DirectMediaInitLegacy = fake_legacy_init;
-    api.DirectMediaLoadLegacy = fake_legacy_load;
+    api.DirectMediaInitCallback = fake_legacy_init;
+    api.DirectMediaLoadCallback = fake_legacy_load;
     return api;
 }
 
@@ -300,7 +298,15 @@ static const BackendNdlVideoInfo k_vp9 = {
     .width = 3840,
     .height = 2160,
 };
-static const BackendNdlPcmInfo k_stereo = {.sample_rate_hz = 48000, .channels = 2};
+static const BackendNdlAudioInfo k_stereo = {
+    .codec = BACKEND_NDL_AUDIO_PCM_S16LE,
+    .sample_rate_hz = 48000,
+    .channels = 2,
+};
+static const BackendNdlPcmInfo k_effect_stereo = {
+    .sample_rate_hz = 48000,
+    .channels = 2,
+};
 static const uint8_t k_data[1920] = {0, 0, 0, 1, 0x65};
 
 typedef struct Capture {
@@ -358,8 +364,6 @@ TEST(BackendNdl, DefaultsOpenAndCallbacks) {
     EXPECT_LT(g_fake.window_sequence, g_fake.init_sequence);
     EXPECT_EQ(g_fake.init_calls, 1);
     EXPECT_STREQ(g_fake.app_id, "test.backend.ndl");
-    EXPECT_EQ(g_fake.dl_init_calls, 0);
-    EXPECT_EQ(g_fake.dl_is_initialized_calls, 0);
     EXPECT_EQ(backend_ndl_get_abi_profile(ctx.get()),
               BACKEND_NDL_ABI_V2_WINDOW_ID_INIT);
     EXPECT_EQ(g_fake.audio_register_calls, 1);
@@ -381,7 +385,6 @@ TEST(BackendNdl, DefaultsOpenAndCallbacks) {
     MultiChannelPCMCallbackFP late_multi = g_fake.multichannel_callback;
     ctx.reset();
     EXPECT_EQ(g_fake.quit_calls, 1);
-    EXPECT_EQ(g_fake.dl_finalize_calls, 0);
 
     late_media(0x17, 0, "late");
     late_multi(2, "late");
@@ -485,13 +488,21 @@ TEST(BackendNdl, MediaLayoutRatesAndGating) {
         EXPECT_EQ(g_fake.last_load.videoDataInfo.source, codecs[i].source);
     }
 
-    BackendNdlPcmInfo mono = {.sample_rate_hz = 48000, .channels = 1};
+    BackendNdlAudioInfo mono = {
+        .codec = BACKEND_NDL_AUDIO_PCM_S16LE,
+        .sample_rate_hz = 48000,
+        .channels = 1,
+    };
     ASSERT_EQ(backend_ndl_set_media(ctx.get(), nullptr, &mono), BACKEND_NDL_OK);
     EXPECT_STREQ(g_fake.last_load.audioDataInfo.audio_data.pcmInfo.channelMode, "mono");
 
     for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
         SCOPED_TRACE(::testing::Message() << "sample rate " << rates[i].hz);
-        BackendNdlPcmInfo pcm = {.sample_rate_hz = rates[i].hz, .channels = 2};
+        BackendNdlAudioInfo pcm = {
+            .codec = BACKEND_NDL_AUDIO_PCM_S16LE,
+            .sample_rate_hz = rates[i].hz,
+            .channels = 2,
+        };
         ASSERT_EQ(backend_ndl_set_media(ctx.get(), nullptr, &pcm), BACKEND_NDL_OK);
         EXPECT_EQ(g_fake.last_load.audioDataInfo.audio_data.pcmInfo.sampleRate,
                   rates[i].code);
@@ -499,7 +510,11 @@ TEST(BackendNdl, MediaLayoutRatesAndGating) {
     }
     EXPECT_FALSE(backend_ndl_pcm_sample_rate_supported(11025));
 
-    BackendNdlPcmInfo surround = {.sample_rate_hz = 48000, .channels = 6};
+    BackendNdlAudioInfo surround = {
+        .codec = BACKEND_NDL_AUDIO_PCM_S16LE,
+        .sample_rate_hz = 48000,
+        .channels = 6,
+    };
     ASSERT_NE(g_fake.multichannel_callback, nullptr);
     g_fake.multichannel_callback(1, "blocked");
     EXPECT_EQ(backend_ndl_set_media(ctx.get(), nullptr, &surround), BACKEND_NDL_UNSUPPORTED);
@@ -541,7 +556,6 @@ TEST(BackendNdl, LegacyProfileLayoutRatesAndCapabilityMask) {
     EXPECT_STREQ(backend_ndl_abi_profile_name(backend_ndl_get_abi_profile(ctx.get())),
                  "v2-callback-init");
     EXPECT_TRUE(g_fake.legacy_init_callback_was_null);
-    EXPECT_EQ(g_fake.dl_init_calls, 0);
     EXPECT_EQ(g_fake.audio_multichannel_calls, 0);
     EXPECT_EQ(g_fake.audio_register_calls, 0);
 
@@ -565,24 +579,31 @@ TEST(BackendNdl, LegacyProfileLayoutRatesAndCapabilityMask) {
 
     for (const auto &rate : rates) {
         SCOPED_TRACE(::testing::Message() << "legacy sample rate " << rate.hz);
-        BackendNdlPcmInfo pcm = {.sample_rate_hz = rate.hz, .channels = 2};
+        BackendNdlAudioInfo pcm = {
+            .codec = BACKEND_NDL_AUDIO_PCM_S16LE,
+            .sample_rate_hz = rate.hz,
+            .channels = 2,
+        };
         ASSERT_EQ(backend_ndl_set_media(ctx.get(), nullptr, &pcm), BACKEND_NDL_OK);
         EXPECT_EQ(g_fake.last_legacy_load.audio.pcm.sample_rate, rate.code);
     }
 
     BackendNdlVideoInfo vp9 = k_vp9;
     EXPECT_EQ(backend_ndl_set_media(ctx.get(), &vp9, nullptr), BACKEND_NDL_UNSUPPORTED);
-    BackendNdlPcmInfo surround = {.sample_rate_hz = 48000, .channels = 6};
+    BackendNdlAudioInfo surround = {
+        .codec = BACKEND_NDL_AUDIO_PCM_S16LE,
+        .sample_rate_hz = 48000,
+        .channels = 6,
+    };
     EXPECT_EQ(backend_ndl_set_media(ctx.get(), nullptr, &surround),
               BACKEND_NDL_UNSUPPORTED);
     BackendNdlHdrInfo hdr{};
     EXPECT_EQ(backend_ndl_set_video_hdr_info(ctx.get(), &hdr), BACKEND_NDL_UNAVAILABLE);
     uint32_t preferred = 0;
-    EXPECT_EQ(backend_ndl_effect_load(ctx.get(), &k_stereo, &preferred),
+    EXPECT_EQ(backend_ndl_effect_load(ctx.get(), &k_effect_stereo, &preferred),
               BACKEND_NDL_UNAVAILABLE);
 
     ctx.reset();
-    EXPECT_EQ(g_fake.dl_finalize_calls, 0);
 
     fake_reset();
     api = fake_api_legacy();
@@ -601,6 +622,93 @@ TEST(BackendNdl, LegacyProfileLayoutRatesAndCapabilityMask) {
         &old_config, BACKEND_NDL_ABI_V2_CALLBACK_INIT, &api));
     EXPECT_EQ(rejected, nullptr);
     EXPECT_EQ(g_fake.init_calls, 0);
+}
+
+TEST(BackendNdl, OpusLayoutAndSilencePrimeForCurrentAndLegacyAbi) {
+    const BackendNdlAudioInfo opus = {
+        .codec = BACKEND_NDL_AUDIO_OPUS,
+        .sample_rate_hz = 48000,
+        .channels = 2,
+    };
+    static const unsigned char silence[] = {0xec, 0xff, 0xfe};
+
+    fake_reset();
+    BackendNdlApi api = fake_api_full();
+    BackendNdlHandle current(open_test_backend(&api));
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(backend_ndl_set_media(current.get(), &k_h264, &opus), BACKEND_NDL_OK);
+    EXPECT_EQ(g_fake.last_load.audioDataInfo.audioCodec, NDL_DIRECTAUDIO_SRC_TYPE_OPUS);
+    EXPECT_EQ(g_fake.last_load.audioDataInfo.audio_data.opusInfo.channels, 2);
+    EXPECT_DOUBLE_EQ(g_fake.last_load.audioDataInfo.audio_data.opusInfo.sampleRate, 48.0);
+    EXPECT_EQ(g_fake.last_load.audioDataInfo.audio_data.opusInfo.streamHeader, nullptr);
+    ASSERT_EQ(g_fake.audio_play_calls, 1);
+    EXPECT_EQ(g_fake.audio_sizes[0], sizeof(silence));
+    EXPECT_EQ(memcmp(g_fake.audio_prefix[0], silence, sizeof(silence)), 0);
+    current.reset();
+
+    fake_reset();
+    api = fake_api_legacy();
+    BackendNdlHandle legacy(open_legacy_backend(&api));
+    ASSERT_NE(legacy, nullptr);
+    ASSERT_EQ(backend_ndl_set_media(legacy.get(), &k_h264, &opus), BACKEND_NDL_OK);
+    EXPECT_EQ(g_fake.last_legacy_load.audio.opus.type, BACKEND_NDL_LEGACY_AUDIO_OPUS);
+    EXPECT_EQ(g_fake.last_legacy_load.audio.opus.channels, 2);
+    EXPECT_DOUBLE_EQ(g_fake.last_legacy_load.audio.opus.sample_rate, 48.0);
+    EXPECT_EQ(g_fake.last_legacy_load.audio.opus.stream_header, nullptr);
+    ASSERT_EQ(g_fake.audio_play_calls, 1);
+    EXPECT_EQ(g_fake.audio_sizes[0], sizeof(silence));
+    EXPECT_EQ(memcmp(g_fake.audio_prefix[0], silence, sizeof(silence)), 0);
+}
+
+TEST(BackendNdl, OpusPrimeRejectionRestoresPreviousMedia) {
+    const BackendNdlAudioInfo opus = {
+        .codec = BACKEND_NDL_AUDIO_OPUS,
+        .sample_rate_hz = 48000,
+        .channels = 2,
+    };
+    fake_reset();
+    BackendNdlApi api = fake_api_full();
+    BackendNdlHandle ctx(open_test_backend(&api));
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, &k_stereo), BACKEND_NDL_OK);
+
+    g_fake.fail_audio_play = true;
+    EXPECT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, &opus), BACKEND_NDL_UNSUPPORTED);
+    g_fake.fail_audio_play = false;
+
+    EXPECT_EQ(g_fake.last_load.audioDataInfo.audioCodec, NDL_DIRECTAUDIO_SRC_TYPE_PCM);
+    EXPECT_EQ(backend_ndl_feed_video(ctx.get(), k_data, 16, 0, false),
+              BACKEND_NDL_NEED_KEYFRAME);
+    EXPECT_EQ(backend_ndl_feed_audio(ctx.get(), k_data, 16, BACKEND_NDL_PTS_AUTO),
+              BACKEND_NDL_OK);
+}
+
+TEST(BackendNdl, FailedFirstOpusPrimeUnloadCanBeRetried) {
+    const BackendNdlAudioInfo opus = {
+        .codec = BACKEND_NDL_AUDIO_OPUS,
+        .sample_rate_hz = 48000,
+        .channels = 2,
+    };
+    fake_reset();
+    BackendNdlApi api = fake_api_full();
+    BackendNdlHandle ctx(open_test_backend(&api));
+    ASSERT_NE(ctx, nullptr);
+
+    g_fake.fail_audio_play = true;
+    g_fake.fail_unload = true;
+    EXPECT_EQ(backend_ndl_set_media(ctx.get(), nullptr, &opus),
+              BACKEND_NDL_UNSUPPORTED);
+    EXPECT_EQ(g_fake.load_calls, 1);
+    EXPECT_EQ(g_fake.unload_calls, 1);
+    EXPECT_EQ(backend_ndl_feed_audio(ctx.get(), k_data, 16, 0),
+              BACKEND_NDL_NOT_READY);
+
+    g_fake.fail_audio_play = false;
+    g_fake.fail_unload = false;
+    EXPECT_EQ(backend_ndl_unload(ctx.get()), BACKEND_NDL_OK);
+    EXPECT_EQ(g_fake.unload_calls, 2);
+    EXPECT_EQ(backend_ndl_set_media(ctx.get(), nullptr, &k_stereo),
+              BACKEND_NDL_OK);
 }
 
 TEST(BackendNdl, VideoAudioAndEffectControls) {
@@ -641,7 +749,7 @@ TEST(BackendNdl, VideoAudioAndEffectControls) {
     EXPECT_EQ(g_fake.last_app_state, NDL_DIRECTMEDIA_APP_STATE_BACKGROUND);
 
     uint32_t preferred = 0;
-    EXPECT_EQ(backend_ndl_effect_load(ctx.get(), &k_stereo, &preferred), BACKEND_NDL_OK);
+    EXPECT_EQ(backend_ndl_effect_load(ctx.get(), &k_effect_stereo, &preferred), BACKEND_NDL_OK);
     EXPECT_EQ(preferred, g_fake.effect_preferred);
     EXPECT_STREQ(g_fake.last_effect_pcm.layout, "interleaved");
     uint32_t available = 0;
@@ -664,7 +772,7 @@ TEST(BackendNdl, VideoAudioAndEffectControls) {
     ctx.reset(open_test_backend(&api));
     ASSERT_NE(ctx, nullptr);
     EXPECT_EQ(backend_ndl_get_capabilities(ctx.get()) & BACKEND_NDL_CAP_EFFECT, 0u);
-    EXPECT_EQ(backend_ndl_effect_load(ctx.get(), &k_stereo, &preferred),
+    EXPECT_EQ(backend_ndl_effect_load(ctx.get(), &k_effect_stereo, &preferred),
               BACKEND_NDL_UNAVAILABLE);
 }
 
@@ -704,10 +812,69 @@ TEST(BackendNdl, FeedsAndRollback) {
               BACKEND_NDL_NEED_KEYFRAME);
     EXPECT_EQ(backend_ndl_feed_audio(ctx.get(), k_data, 16, 0), BACKEND_NDL_OK);
 
+    int load_calls = g_fake.load_calls;
+    g_fake.fail_load_remaining = 2;
+    EXPECT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, nullptr), BACKEND_NDL_ERROR);
+    EXPECT_EQ(g_fake.load_calls, load_calls + 2);
+    EXPECT_EQ(backend_ndl_feed_video(ctx.get(), k_data, 16, 0, true),
+              BACKEND_NDL_NOT_READY);
+    EXPECT_EQ(backend_ndl_feed_audio(ctx.get(), k_data, 16, 0), BACKEND_NDL_NOT_READY);
+
+    EXPECT_EQ(backend_ndl_reload(ctx.get()), BACKEND_NDL_OK);
+    EXPECT_EQ(g_fake.load_calls, load_calls + 3);
+    EXPECT_EQ(backend_ndl_feed_video(ctx.get(), k_data, 16, 0, false),
+              BACKEND_NDL_NEED_KEYFRAME);
+    EXPECT_EQ(backend_ndl_feed_audio(ctx.get(), k_data, 16, 0), BACKEND_NDL_OK);
+
     EXPECT_EQ(backend_ndl_unload(ctx.get()), BACKEND_NDL_OK);
     EXPECT_EQ(backend_ndl_feed_audio(ctx.get(), k_data, 16, 0), BACKEND_NDL_NOT_READY);
     EXPECT_EQ(backend_ndl_feed_video(ctx.get(), k_data, 16, 0, true),
               BACKEND_NDL_NOT_READY);
+}
+
+TEST(BackendNdl, FailedMediaUnloadKeepsPreviousTracksReady) {
+    fake_reset();
+    BackendNdlApi api = fake_api_full();
+    BackendNdlHandle ctx(open_test_backend(&api));
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, &k_stereo), BACKEND_NDL_OK);
+    ASSERT_EQ(backend_ndl_feed_video(ctx.get(), k_data, 16, 0, true), BACKEND_NDL_OK);
+
+    int load_calls = g_fake.load_calls;
+    g_fake.fail_unload = true;
+    EXPECT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, nullptr), BACKEND_NDL_ERROR);
+    EXPECT_EQ(g_fake.load_calls, load_calls);
+    EXPECT_EQ(backend_ndl_feed_video(ctx.get(), k_data, 16, 0, false), BACKEND_NDL_OK);
+    EXPECT_EQ(backend_ndl_feed_audio(ctx.get(), k_data, 16, 0), BACKEND_NDL_OK);
+
+    g_fake.fail_unload = false;
+    EXPECT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, nullptr), BACKEND_NDL_OK);
+    EXPECT_EQ(g_fake.load_calls, load_calls + 1);
+    EXPECT_EQ(backend_ndl_feed_audio(ctx.get(), k_data, 16, 0), BACKEND_NDL_NOT_READY);
+}
+
+TEST(BackendNdl, FailedEffectUnloadKeepsPreviousEffectReady) {
+    fake_reset();
+    BackendNdlApi api = fake_api_full();
+    BackendNdlHandle ctx(open_test_backend(&api));
+    ASSERT_NE(ctx, nullptr);
+
+    uint32_t preferred = 0;
+    ASSERT_EQ(backend_ndl_effect_load(ctx.get(), &k_effect_stereo, &preferred),
+              BACKEND_NDL_OK);
+    ASSERT_EQ(g_fake.effect_load_calls, 1);
+
+    g_fake.fail_effect_unload = true;
+    EXPECT_EQ(backend_ndl_effect_load(ctx.get(), &k_effect_stereo, &preferred),
+              BACKEND_NDL_ERROR);
+    EXPECT_EQ(g_fake.effect_unload_calls, 1);
+    EXPECT_EQ(g_fake.effect_load_calls, 1);
+    EXPECT_EQ(backend_ndl_effect_feed(ctx.get(), k_data, 16), BACKEND_NDL_OK);
+
+    g_fake.fail_effect_unload = false;
+    EXPECT_EQ(backend_ndl_effect_unload(ctx.get()), BACKEND_NDL_OK);
+    EXPECT_EQ(g_fake.effect_unload_calls, 2);
+    EXPECT_EQ(backend_ndl_effect_feed(ctx.get(), k_data, 16), BACKEND_NDL_NOT_READY);
 }
 
 TEST(BackendNdl, EmergencyReleaseQuitsOnceWhileOpen) {
@@ -759,8 +926,16 @@ TEST(BackendNdl, ValidationAndNames) {
     BackendNdlApi api = fake_api_full();
     BackendNdlHandle ctx(open_test_backend(&api));
     ASSERT_NE(ctx, nullptr);
-    BackendNdlPcmInfo bad_rate = {.sample_rate_hz = 11025, .channels = 2};
-    BackendNdlPcmInfo bad_channels = {.sample_rate_hz = 48000, .channels = 3};
+    BackendNdlAudioInfo bad_rate = {
+        .codec = BACKEND_NDL_AUDIO_PCM_S16LE,
+        .sample_rate_hz = 11025,
+        .channels = 2,
+    };
+    BackendNdlAudioInfo bad_channels = {
+        .codec = BACKEND_NDL_AUDIO_PCM_S16LE,
+        .sample_rate_hz = 48000,
+        .channels = 3,
+    };
     BackendNdlVideoInfo bad_video = k_h264;
     bad_video.width = 0;
     EXPECT_EQ(backend_ndl_set_media(ctx.get(), nullptr, &bad_rate), BACKEND_NDL_UNSUPPORTED);

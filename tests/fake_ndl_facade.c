@@ -3,7 +3,6 @@
 
 #include <stdbool.h>
 
-static bool g_dl_initialized;
 static bool g_loaded;
 static bool g_effect_loaded;
 
@@ -67,6 +66,3 @@ int NDL_DirectEffectGetAvailableBufferSize(unsigned int *available) {
     *available = 4096;
     return 0;
 }
-bool NDL_DirectMedia_DL_Initialize(void) { g_dl_initialized = true; return true; }
-void NDL_DirectMedia_DL_Finalize(void) { g_dl_initialized = false; }
-bool NDL_DirectMedia_DL_IsInitialized(void) { return g_dl_initialized; }

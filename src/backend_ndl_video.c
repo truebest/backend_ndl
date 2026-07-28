@@ -8,8 +8,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#if defined(BACKEND_NDL_ENABLED) && BACKEND_NDL_ENABLED
-
 static NDL_DIRECTVIDEO_HDR_INFO_T backend_ndl_sdk_hdr(const BackendNdlHdrInfo *info) {
     NDL_DIRECTVIDEO_HDR_INFO_T result;
     _Static_assert(sizeof(result) == sizeof(*info), "public/private HDR layouts match");
@@ -17,21 +15,22 @@ static NDL_DIRECTVIDEO_HDR_INFO_T backend_ndl_sdk_hdr(const BackendNdlHdrInfo *i
     return result;
 }
 
-BackendNdlResult backend_ndl_video_fill_media_info_locked(BackendNdl *ctx,
-                                                          BackendNdlMediaInfo *out) {
-    if (ctx->video.width == 0 || ctx->video.height == 0) {
+BackendNdlResult backend_ndl_video_fill_media_info(BackendNdlAbiProfile profile,
+                                                   const BackendNdlVideoInfo *video,
+                                                   BackendNdlMediaInfo *out) {
+    if (video->width == 0 || video->height == 0) {
         return BACKEND_NDL_INVALID_ARGUMENT;
     }
-    if (ctx->abi_profile == BACKEND_NDL_ABI_V2_CALLBACK_INIT) {
-        if (ctx->video.codec != BACKEND_NDL_VIDEO_H264) {
+    if (profile == BACKEND_NDL_ABI_V2_CALLBACK_INIT) {
+        if (video->codec != BACKEND_NDL_VIDEO_H264) {
             return BACKEND_NDL_UNSUPPORTED;
         }
-        out->legacy.video.width = (int)ctx->video.width;
-        out->legacy.video.height = (int)ctx->video.height;
-        out->legacy.video.type = BACKEND_NDL_LEGACY_VIDEO_H264;
+        out->callback.video.width = (int)video->width;
+        out->callback.video.height = (int)video->height;
+        out->callback.video.type = BACKEND_NDL_LEGACY_VIDEO_H264;
         return BACKEND_NDL_OK;
     }
-    switch (ctx->video.codec) {
+    switch (video->codec) {
         case BACKEND_NDL_VIDEO_H264:
             out->current.videoDataInfo.source = NDL_DIRECTVIDEO_SRC_TYPE_H264;
             break;
@@ -47,13 +46,13 @@ BackendNdlResult backend_ndl_video_fill_media_info_locked(BackendNdl *ctx,
         default:
             return BACKEND_NDL_UNSUPPORTED;
     }
-    out->current.videoDataInfo.width = (int)ctx->video.width;
-    out->current.videoDataInfo.height = (int)ctx->video.height;
+    out->current.videoDataInfo.width = (int)video->width;
+    out->current.videoDataInfo.height = (int)video->height;
     return BACKEND_NDL_OK;
 }
 
 void backend_ndl_video_after_load_locked(BackendNdl *ctx) {
-    if (!ctx->has_video) return;
+    if (!ctx->media.has_video) return;
     if (ctx->config.video_frame_drop_threshold >= 0 &&
         ctx->api.DirectVideoSetFrameDropThreshold) {
         int rc = ctx->api.DirectVideoSetFrameDropThreshold(
@@ -74,8 +73,9 @@ void backend_ndl_video_after_load_locked(BackendNdl *ctx) {
                             backend_ndl_last_error(ctx));
         }
     }
-    if (ctx->has_video_hdr && ctx->api.DirectVideoSetHDRInfo) {
-        int rc = ctx->api.DirectVideoSetHDRInfo(backend_ndl_sdk_hdr(&ctx->video_hdr));
+    if (ctx->media.has_video_hdr && ctx->api.DirectVideoSetHDRInfo) {
+        int rc =
+            ctx->api.DirectVideoSetHDRInfo(backend_ndl_sdk_hdr(&ctx->media.video_hdr));
         if (rc != 0) {
             BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_WARN,
                             "NDL_DirectVideoSetHDRInfo failed rc=%d error=%s", rc,
@@ -142,9 +142,14 @@ BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
     if (is_keyframe && (after_play & BACKEND_NDL_FEED_NEED_KEYFRAME) != 0) {
         unsigned long long expected = after_play;
         unsigned long long desired = after_play & ~BACKEND_NDL_FEED_NEED_KEYFRAME;
-        (void)atomic_compare_exchange_strong_explicit(&ctx->feed_state, &expected, desired,
-                                                      memory_order_acq_rel,
-                                                      memory_order_acquire);
+        if (!atomic_compare_exchange_strong_explicit(&ctx->feed_state, &expected, desired,
+                                                     memory_order_acq_rel,
+                                                     memory_order_acquire) &&
+            !backend_ndl_video_state_ready(state, expected)) {
+            return (expected & BACKEND_NDL_FEED_VIDEO_READY) != 0
+                       ? BACKEND_NDL_NEED_KEYFRAME
+                       : BACKEND_NDL_NOT_READY;
+        }
     }
 
     unsigned long long count = atomic_fetch_add_explicit(&ctx->video_feed_count, 1,
@@ -187,7 +192,7 @@ BackendNdlResult backend_ndl_set_video_area(BackendNdl *ctx, int left, int top,
     ctx->video_width = width;
     ctx->video_height = height;
     int rc = 0;
-    if (ctx->media_loaded && ctx->has_video) {
+    if (ctx->media_loaded && ctx->media.has_video) {
         rc = ctx->api.DirectVideoSetArea(left, top, width, height);
     }
     pthread_mutex_unlock(&ctx->lifecycle_lock);
@@ -200,7 +205,7 @@ BackendNdlResult backend_ndl_set_video_frame_drop_threshold(BackendNdl *ctx, int
     pthread_mutex_lock(&ctx->lifecycle_lock);
     ctx->config.video_frame_drop_threshold = threshold;
     int rc = 0;
-    if (ctx->media_loaded && ctx->has_video) {
+    if (ctx->media_loaded && ctx->media.has_video) {
         rc = ctx->api.DirectVideoSetFrameDropThreshold(threshold);
     }
     pthread_mutex_unlock(&ctx->lifecycle_lock);
@@ -214,16 +219,16 @@ BackendNdlResult backend_ndl_set_video_hdr_info(BackendNdl *ctx,
         return BACKEND_NDL_UNAVAILABLE;
     }
     pthread_mutex_lock(&ctx->lifecycle_lock);
-    if (!ctx->has_video) {
+    if (!ctx->media.has_video) {
         pthread_mutex_unlock(&ctx->lifecycle_lock);
         return BACKEND_NDL_NOT_READY;
     }
-    if (ctx->video.codec != BACKEND_NDL_VIDEO_VP9) {
+    if (ctx->media.video.codec != BACKEND_NDL_VIDEO_VP9) {
         pthread_mutex_unlock(&ctx->lifecycle_lock);
         return BACKEND_NDL_UNSUPPORTED;
     }
-    ctx->has_video_hdr = true;
-    ctx->video_hdr = *info;
+    ctx->media.has_video_hdr = true;
+    ctx->media.video_hdr = *info;
     int rc = 0;
     if (ctx->media_loaded) {
         rc = ctx->api.DirectVideoSetHDRInfo(backend_ndl_sdk_hdr(info));
@@ -231,33 +236,3 @@ BackendNdlResult backend_ndl_set_video_hdr_info(BackendNdl *ctx,
     pthread_mutex_unlock(&ctx->lifecycle_lock);
     return rc == 0 ? BACKEND_NDL_OK : BACKEND_NDL_ERROR;
 }
-
-#else
-
-#include <backend_ndl/backend_ndl.h>
-
-BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx, const void *data, size_t len,
-                                        long long ndl_pts, bool is_keyframe) {
-    (void)ctx; (void)data; (void)len; (void)ndl_pts; (void)is_keyframe;
-    return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_get_video_render_buffer_length(BackendNdl *ctx, int *frames) {
-    (void)ctx; (void)frames; return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_flush_video_render_buffer(BackendNdl *ctx) {
-    (void)ctx; return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_set_video_area(BackendNdl *ctx, int left, int top,
-                                            int width, int height) {
-    (void)ctx; (void)left; (void)top; (void)width; (void)height;
-    return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_set_video_frame_drop_threshold(BackendNdl *ctx, int threshold) {
-    (void)ctx; (void)threshold; return BACKEND_NDL_UNAVAILABLE;
-}
-BackendNdlResult backend_ndl_set_video_hdr_info(BackendNdl *ctx,
-                                                const BackendNdlHdrInfo *info) {
-    (void)ctx; (void)info; return BACKEND_NDL_UNAVAILABLE;
-}
-
-#endif

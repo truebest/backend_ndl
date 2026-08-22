@@ -220,6 +220,14 @@ long long backend_ndl_monotonic_ms(void) {
     return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
+long long backend_ndl_monotonic_us(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (long long)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+}
+
 uint64_t backend_ndl_feed_generation(uint64_t state) {
     return state >> BACKEND_NDL_FEED_GENERATION_SHIFT;
 }
@@ -489,6 +497,7 @@ static BackendNdlResult backend_ndl_load_media_info_locked(
     BackendNdlMediaInfo *info,
     const char *operation) {
     int rc;
+    backend_ndl_video_before_load_locked(ctx);
     if (ctx->abi_profile == BACKEND_NDL_ABI_V2_WINDOW_ID_INIT) {
         rc = ctx->api.DirectMediaLoadCurrent(&info->current, backend_ndl_load_callback);
     } else {
@@ -523,6 +532,8 @@ static BackendNdlResult backend_ndl_publish_loaded_locked(
         }
         return audio_result;
     }
+
+    backend_ndl_video_reset_runtime_stats(ctx);
 
     uint64_t flags = backend_ndl_loaded_feed_flags(ctx, media);
     atomic_store_explicit(&ctx->feed_state, transition_state | flags, memory_order_release);
@@ -695,6 +706,13 @@ static BackendNdl *backend_ndl_open_common(const BackendNdlConfig *config,
     atomic_init(&ctx->audio_not_ready_streak, 0);
     atomic_init(&ctx->audio_error_streak, 0);
     atomic_init(&ctx->video_error_streak, 0);
+    atomic_init(&ctx->video_play_samples, 0);
+    atomic_init(&ctx->video_play_us_ewma, 0);
+    atomic_init(&ctx->video_play_us_max, 0);
+    atomic_init(&ctx->video_play_errors, 0);
+    atomic_init(&ctx->video_stats_epoch, 0);
+    atomic_init(&ctx->video_stats_writers, 0);
+    atomic_init(&ctx->video_stats_version, 0);
     atomic_init(&ctx->multichannel_status, BACKEND_NDL_MULTICHANNEL_UNKNOWN);
 
     ctx->app_id = backend_ndl_strdup(config->app_id);

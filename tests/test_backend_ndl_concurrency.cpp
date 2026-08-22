@@ -21,6 +21,7 @@ typedef struct FakeConcurrent {
     bool release_plays;
     bool fail_plays;
     int entered_plays;
+    std::atomic<bool> fail_unload;
     std::atomic<int> load_calls;
     std::atomic<int> unload_calls;
     std::atomic<int> quit_calls;
@@ -29,6 +30,26 @@ typedef struct FakeConcurrent {
 } FakeConcurrent;
 
 static FakeConcurrent g_fake;
+static BackendNdlResult g_stats_hook_reload_result;
+static bool g_block_first_stats_writer;
+static bool g_release_first_stats_writer;
+static int g_stats_writers_entered;
+
+static void reload_after_video_stats_begin(BackendNdl *ctx) {
+    g_stats_hook_reload_result = backend_ndl_reload(ctx);
+}
+
+static void block_first_video_stats_writer(BackendNdl *ctx) {
+    (void)ctx;
+    pthread_mutex_lock(&g_fake.lock);
+    int writer = ++g_stats_writers_entered;
+    pthread_cond_broadcast(&g_fake.cond);
+    while (g_block_first_stats_writer && writer == 1 &&
+           !g_release_first_stats_writer) {
+        pthread_cond_wait(&g_fake.cond, &g_fake.lock);
+    }
+    pthread_mutex_unlock(&g_fake.lock);
+}
 
 static const char *fake_error(void) { return "concurrent fake error"; }
 static int fake_window(const char *window) { return window ? 0 : -1; }
@@ -51,7 +72,10 @@ static int fake_legacy_load(BackendNdlLegacyMediaInfo *info,
     g_fake.load_calls.fetch_add(1);
     return 0;
 }
-static int fake_unload(void) { g_fake.unload_calls.fetch_add(1); return 0; }
+static int fake_unload(void) {
+    g_fake.unload_calls.fetch_add(1);
+    return g_fake.fail_unload.load() ? -1 : 0;
+}
 static int fake_available(int *available) { *available = 1 << 20; return 0; }
 static int fake_multichannel(int *status) { *status = 3; return 0; }
 static int fake_register(MultiChannelPCMCallbackFP cb) { (void)cb; return 0; }
@@ -109,6 +133,9 @@ static void fake_reset(void) {
     g_fake.release_plays = false;
     g_fake.fail_plays = false;
     g_fake.entered_plays = 0;
+    g_block_first_stats_writer = false;
+    g_release_first_stats_writer = false;
+    g_stats_writers_entered = 0;
     pthread_mutex_init(&g_fake.lock, nullptr);
     pthread_cond_init(&g_fake.cond, nullptr);
     g_fake.load_calls.store(0);
@@ -116,6 +143,7 @@ static void fake_reset(void) {
     g_fake.quit_calls.store(0);
     g_fake.audio_calls.store(0);
     g_fake.video_calls.store(0);
+    g_fake.fail_unload.store(false);
 }
 
 static void fake_destroy(void) {
@@ -125,8 +153,15 @@ static void fake_destroy(void) {
 
 class FakeConcurrentGuard {
     public:
-    FakeConcurrentGuard() { fake_reset(); }
-    ~FakeConcurrentGuard() { fake_destroy(); }
+    FakeConcurrentGuard() {
+        backend_ndl_test_set_after_video_stats_begin(nullptr);
+        g_stats_hook_reload_result = BACKEND_NDL_ERROR;
+        fake_reset();
+    }
+    ~FakeConcurrentGuard() {
+        backend_ndl_test_set_after_video_stats_begin(nullptr);
+        fake_destroy();
+    }
 
     FakeConcurrentGuard(const FakeConcurrentGuard &) = delete;
     FakeConcurrentGuard &operator=(const FakeConcurrentGuard &) = delete;
@@ -202,6 +237,13 @@ static void release_plays(void) {
     pthread_mutex_unlock(&g_fake.lock);
 }
 
+static void release_first_stats_writer(void) {
+    pthread_mutex_lock(&g_fake.lock);
+    g_release_first_stats_writer = true;
+    pthread_cond_broadcast(&g_fake.cond);
+    pthread_mutex_unlock(&g_fake.lock);
+}
+
 static bool wait_for_reload_after(int unload_before) {
     for (int i = 0; i < 100000 && g_fake.unload_calls.load() == unload_before; i++) {
         sched_yield();
@@ -263,6 +305,104 @@ TEST_P(BackendNdlConcurrencyTest, ReloadCrossesFeedGeneration) {
     EXPECT_EQ(reload.result, BACKEND_NDL_OK);
     EXPECT_EQ(feed.result, BACKEND_NDL_NEED_KEYFRAME);
     EXPECT_EQ(delta, BACKEND_NDL_NEED_KEYFRAME);
+}
+
+TEST_P(BackendNdlConcurrencyTest, ReloadExcludesFeedFromPreviousStatsEpoch) {
+    FakeConcurrentGuard fake;
+    BackendNdlHandle ctx(open_backend(true, GetParam()));
+    ASSERT_NE(ctx.get(), nullptr);
+    uint8_t data[16] = {0};
+
+    backend_ndl_test_set_after_video_stats_begin(reload_after_video_stats_begin);
+    BackendNdlResult crossed =
+        backend_ndl_feed_video(ctx.get(), data, sizeof(data), 0, true);
+    backend_ndl_test_set_after_video_stats_begin(nullptr);
+
+    EXPECT_EQ(g_stats_hook_reload_result, BACKEND_NDL_OK);
+    EXPECT_EQ(crossed, BACKEND_NDL_NEED_KEYFRAME);
+    BackendNdlRuntimeStats stats{};
+    ASSERT_EQ(backend_ndl_get_runtime_stats(ctx.get(), &stats), BACKEND_NDL_OK);
+    EXPECT_EQ(stats.video_play_samples, 0u);
+    EXPECT_EQ(stats.video_play_us_ewma, 0u);
+    EXPECT_EQ(stats.video_play_us_max, 0u);
+    EXPECT_EQ(stats.video_play_errors, 0u);
+
+    ASSERT_EQ(backend_ndl_feed_video(ctx.get(), data, sizeof(data), 0, true),
+              BACKEND_NDL_OK);
+    ASSERT_EQ(backend_ndl_get_runtime_stats(ctx.get(), &stats), BACKEND_NDL_OK);
+    EXPECT_EQ(stats.video_play_samples, 1u);
+    EXPECT_EQ(stats.video_play_errors, 0u);
+    EXPECT_GE(stats.video_play_us_max, stats.video_play_us_ewma);
+}
+
+TEST_P(BackendNdlConcurrencyTest, ConcurrentVideoFeedsBothReachRuntimeStats) {
+    FakeConcurrentGuard fake;
+    BackendNdlHandle ctx(open_backend(false, GetParam()));
+    ASSERT_NE(ctx.get(), nullptr);
+
+    pthread_mutex_lock(&g_fake.lock);
+    g_block_first_stats_writer = true;
+    pthread_mutex_unlock(&g_fake.lock);
+    backend_ndl_test_set_after_video_stats_begin(block_first_video_stats_writer);
+
+    FeedArgs first = {ctx.get(), true, BACKEND_NDL_ERROR};
+    FeedArgs second = {ctx.get(), true, BACKEND_NDL_ERROR};
+    std::thread first_id(feed_thread, &first);
+    bool first_blocked = wait_for_value(&g_stats_writers_entered, 1);
+    if (!first_blocked) {
+        release_first_stats_writer();
+        first_id.join();
+        FAIL() << "first video stats writer did not reach the test hook";
+    }
+
+    std::thread second_id(feed_thread, &second);
+    second_id.join();
+    release_first_stats_writer();
+    first_id.join();
+    backend_ndl_test_set_after_video_stats_begin(nullptr);
+
+    EXPECT_EQ(first.result, BACKEND_NDL_OK);
+    EXPECT_EQ(second.result, BACKEND_NDL_OK);
+    EXPECT_EQ(g_stats_writers_entered, 2);
+    BackendNdlRuntimeStats stats{};
+    ASSERT_EQ(backend_ndl_get_runtime_stats(ctx.get(), &stats), BACKEND_NDL_OK);
+    EXPECT_EQ(stats.video_play_samples, 2u);
+    EXPECT_EQ(stats.video_play_errors, 0u);
+    EXPECT_GE(stats.video_play_us_max, stats.video_play_us_ewma);
+}
+
+TEST_P(BackendNdlConcurrencyTest, FailedUnloadKeepsCrossedFeedInRuntimeStats) {
+    FakeConcurrentGuard fake;
+    BackendNdlHandle ctx(open_backend(false, GetParam()));
+    ASSERT_NE(ctx.get(), nullptr);
+    set_play_behavior(true, false);
+
+    FeedArgs feed = {ctx.get(), true, BACKEND_NDL_ERROR};
+    FeedArgs reload = {ctx.get(), false, BACKEND_NDL_OK};
+    std::thread feed_id(feed_thread, &feed);
+    bool entered = wait_for_value(&g_fake.entered_plays, 1);
+    if (!entered) {
+        release_plays();
+        feed_id.join();
+        FAIL() << "video feed did not enter the fake DirectVideoPlay call";
+    }
+
+    g_fake.fail_unload.store(true);
+    int unload_before = g_fake.unload_calls.load();
+    std::thread reload_id(reload_thread, &reload);
+    bool reload_overlapped = wait_for_reload_after(unload_before);
+    reload_id.join();
+    release_plays();
+    feed_id.join();
+    g_fake.fail_unload.store(false);
+
+    EXPECT_TRUE(reload_overlapped);
+    EXPECT_EQ(reload.result, BACKEND_NDL_ERROR);
+    EXPECT_EQ(feed.result, BACKEND_NDL_NEED_KEYFRAME);
+    BackendNdlRuntimeStats stats{};
+    ASSERT_EQ(backend_ndl_get_runtime_stats(ctx.get(), &stats), BACKEND_NDL_OK);
+    EXPECT_EQ(stats.video_play_samples, 1u);
+    EXPECT_EQ(stats.video_play_errors, 0u);
 }
 
 TEST_P(BackendNdlConcurrencyTest, AudioErrorCrossedByReloadIsTransient) {

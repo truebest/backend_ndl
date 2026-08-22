@@ -15,6 +15,10 @@ typedef struct FakeNdl {
     unsigned sequence;
     unsigned window_sequence;
     unsigned init_sequence;
+    unsigned load_sequence;
+    unsigned unload_sequence;
+    unsigned video_threshold_sequence;
+    int loads_without_fresh_threshold;
     int get_error_calls;
     int set_window_calls;
     int init_calls;
@@ -116,6 +120,13 @@ static int fake_set_app_state(NDL_DIRECTMEDIA_APP_STATE state) {
 }
 static int fake_load(NDL_DIRECTMEDIA_DATA_INFO_T *data, StateCallbackFP cb) {
     g_fake.load_calls++;
+    unsigned load_sequence = ++g_fake.sequence;
+    if (g_fake.video_threshold_sequence <= g_fake.load_sequence ||
+        g_fake.video_threshold_sequence <= g_fake.unload_sequence ||
+        g_fake.video_threshold_sequence >= load_sequence) {
+        g_fake.loads_without_fresh_threshold++;
+    }
+    g_fake.load_sequence = load_sequence;
     g_fake.last_load = *data;
     g_fake.media_callback = cb;
     if (g_fake.fail_load_remaining > 0) {
@@ -127,6 +138,13 @@ static int fake_load(NDL_DIRECTMEDIA_DATA_INFO_T *data, StateCallbackFP cb) {
 static int fake_legacy_load(BackendNdlLegacyMediaInfo *data,
                             BackendNdlLegacyStateCallbackFn cb) {
     g_fake.load_calls++;
+    unsigned load_sequence = ++g_fake.sequence;
+    if (g_fake.video_threshold_sequence <= g_fake.load_sequence ||
+        g_fake.video_threshold_sequence <= g_fake.unload_sequence ||
+        g_fake.video_threshold_sequence >= load_sequence) {
+        g_fake.loads_without_fresh_threshold++;
+    }
+    g_fake.load_sequence = load_sequence;
     g_fake.last_legacy_load = *data;
     g_fake.media_callback = cb;
     if (g_fake.fail_load_remaining > 0) {
@@ -137,6 +155,7 @@ static int fake_legacy_load(BackendNdlLegacyMediaInfo *data,
 }
 static int fake_unload(void) {
     g_fake.unload_calls++;
+    g_fake.unload_sequence = ++g_fake.sequence;
     return g_fake.fail_unload ? -1 : 0;
 }
 static int fake_audio_play(void *data, unsigned int size, long long pts) {
@@ -193,6 +212,7 @@ static int fake_video_hdr(NDL_DIRECTVIDEO_HDR_INFO_T info) {
 }
 static int fake_video_threshold(int threshold) {
     g_fake.video_threshold_calls++;
+    g_fake.video_threshold_sequence = ++g_fake.sequence;
     g_fake.last_threshold = threshold;
     return 0;
 }
@@ -315,12 +335,18 @@ typedef struct Capture {
     int event_type;
     int multichannel_events;
     BackendNdlMultichannelStatus multichannel_status;
+    int video_sink_logs;
+    char video_sink_log[512];
 } Capture;
 
 static void capture_log(void *userdata, BackendNdlLogLevel level, const char *message) {
     (void)level;
-    (void)message;
-    ((Capture *)userdata)->logs++;
+    Capture *capture = (Capture *)userdata;
+    capture->logs++;
+    if (message && strstr(message, "video sink:") != nullptr) {
+        capture->video_sink_logs++;
+        snprintf(capture->video_sink_log, sizeof(capture->video_sink_log), "%s", message);
+    }
 }
 static void capture_event(void *userdata, int type, int64_t number, const char *text) {
     (void)number;
@@ -776,6 +802,83 @@ TEST(BackendNdl, VideoAudioAndEffectControls) {
               BACKEND_NDL_UNAVAILABLE);
 }
 
+TEST(BackendNdl, VideoThresholdPrecedesInitialReloadAndRestoreLoads) {
+    for (int profile = 0; profile < 2; profile++) {
+        SCOPED_TRACE(profile == 0 ? "current ABI" : "legacy ABI");
+        fake_reset();
+        BackendNdlApi api = profile == 0 ? fake_api_full() : fake_api_legacy();
+        BackendNdlHandle ctx(profile == 0 ? open_test_backend(&api)
+                                          : open_legacy_backend(&api));
+        ASSERT_NE(ctx, nullptr);
+
+        ASSERT_EQ(backend_ndl_set_video_frame_drop_threshold(ctx.get(), 2),
+                  BACKEND_NDL_OK);
+        ASSERT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, &k_stereo),
+                  BACKEND_NDL_OK);
+        EXPECT_EQ(g_fake.video_threshold_calls, 1);
+        EXPECT_EQ(g_fake.load_calls, 1);
+        EXPECT_EQ(g_fake.loads_without_fresh_threshold, 0);
+
+        ASSERT_EQ(backend_ndl_reload(ctx.get()), BACKEND_NDL_OK);
+        EXPECT_EQ(g_fake.video_threshold_calls, 2);
+        EXPECT_EQ(g_fake.load_calls, 2);
+        EXPECT_EQ(g_fake.loads_without_fresh_threshold, 0);
+
+        g_fake.fail_load_remaining = 1;
+        EXPECT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, nullptr),
+                  BACKEND_NDL_ERROR);
+        EXPECT_EQ(g_fake.video_threshold_calls, 4);
+        EXPECT_EQ(g_fake.load_calls, 4);
+        EXPECT_EQ(g_fake.loads_without_fresh_threshold, 0);
+    }
+}
+
+TEST(BackendNdl, VideoThresholdSetterConfiguresOnlyFutureLoads) {
+    for (int profile = 0; profile < 2; profile++) {
+        SCOPED_TRACE(profile == 0 ? "current ABI" : "legacy ABI");
+        fake_reset();
+        BackendNdlApi api = profile == 0 ? fake_api_full() : fake_api_legacy();
+        BackendNdlHandle ctx(profile == 0 ? open_test_backend(&api)
+                                          : open_legacy_backend(&api));
+        ASSERT_NE(ctx, nullptr);
+
+        ASSERT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, nullptr), BACKEND_NDL_OK);
+        EXPECT_EQ(g_fake.video_threshold_calls, 0);
+
+        ASSERT_EQ(backend_ndl_set_video_frame_drop_threshold(ctx.get(), 3),
+                  BACKEND_NDL_OK);
+        EXPECT_EQ(g_fake.video_threshold_calls, 0);
+        ASSERT_EQ(backend_ndl_reload(ctx.get()), BACKEND_NDL_OK);
+        EXPECT_EQ(g_fake.video_threshold_calls, 1);
+        EXPECT_EQ(g_fake.last_threshold, 3);
+
+        ASSERT_EQ(backend_ndl_set_video_frame_drop_threshold(ctx.get(), 0),
+                  BACKEND_NDL_OK);
+        EXPECT_EQ(g_fake.video_threshold_calls, 1);
+        ASSERT_EQ(backend_ndl_reload(ctx.get()), BACKEND_NDL_OK);
+        EXPECT_EQ(g_fake.video_threshold_calls, 1);
+
+        ASSERT_EQ(backend_ndl_set_video_frame_drop_threshold(ctx.get(), 1),
+                  BACKEND_NDL_OK);
+        EXPECT_EQ(g_fake.video_threshold_calls, 1);
+        ASSERT_EQ(backend_ndl_reload(ctx.get()), BACKEND_NDL_OK);
+        EXPECT_EQ(g_fake.video_threshold_calls, 1);
+
+        ASSERT_EQ(backend_ndl_set_video_frame_drop_threshold(ctx.get(), 2),
+                  BACKEND_NDL_OK);
+        EXPECT_EQ(g_fake.video_threshold_calls, 1);
+        ASSERT_EQ(backend_ndl_reload(ctx.get()), BACKEND_NDL_OK);
+        EXPECT_EQ(g_fake.video_threshold_calls, 2);
+        EXPECT_EQ(g_fake.last_threshold, 2);
+
+        EXPECT_EQ(backend_ndl_set_video_frame_drop_threshold(ctx.get(), -1),
+                  BACKEND_NDL_INVALID_ARGUMENT);
+        ASSERT_EQ(backend_ndl_reload(ctx.get()), BACKEND_NDL_OK);
+        EXPECT_EQ(g_fake.video_threshold_calls, 3);
+        EXPECT_EQ(g_fake.last_threshold, 2);
+    }
+}
+
 TEST(BackendNdl, FeedsAndRollback) {
     fake_reset();
     BackendNdlApi api = fake_api_full();
@@ -832,6 +935,90 @@ TEST(BackendNdl, FeedsAndRollback) {
               BACKEND_NDL_NOT_READY);
 }
 
+TEST(BackendNdl, VideoRuntimeStatsIncludeFailuresAndResetOnReload) {
+    fake_reset();
+    BackendNdlApi api = fake_api_full();
+    BackendNdlHandle ctx(open_test_backend(&api));
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, nullptr), BACKEND_NDL_OK);
+
+    BackendNdlRuntimeStats stats{};
+    EXPECT_EQ(backend_ndl_get_runtime_stats(ctx.get(), &stats), BACKEND_NDL_OK);
+    EXPECT_EQ(stats.video_play_samples, 0u);
+    EXPECT_EQ(stats.video_play_errors, 0u);
+
+    ASSERT_EQ(backend_ndl_feed_video(ctx.get(), k_data, 16, 0, true), BACKEND_NDL_OK);
+    g_fake.fail_video_play = true;
+    EXPECT_EQ(backend_ndl_feed_video(ctx.get(), k_data, 16, 0, false),
+              BACKEND_NDL_ERROR);
+    g_fake.fail_video_play = false;
+
+    ASSERT_EQ(backend_ndl_get_runtime_stats(ctx.get(), &stats), BACKEND_NDL_OK);
+    EXPECT_EQ(stats.video_play_samples, 2u);
+    EXPECT_EQ(stats.video_play_errors, 1u);
+    EXPECT_GE(stats.video_play_us_max, stats.video_play_us_ewma);
+
+    ASSERT_EQ(backend_ndl_reload(ctx.get()), BACKEND_NDL_OK);
+    ASSERT_EQ(backend_ndl_get_runtime_stats(ctx.get(), &stats), BACKEND_NDL_OK);
+    EXPECT_EQ(stats.video_play_samples, 0u);
+    EXPECT_EQ(stats.video_play_us_ewma, 0u);
+    EXPECT_EQ(stats.video_play_us_max, 0u);
+    EXPECT_EQ(stats.video_play_errors, 0u);
+    EXPECT_EQ(backend_ndl_feed_video(ctx.get(), k_data, 16, 0, false),
+              BACKEND_NDL_NEED_KEYFRAME);
+}
+
+TEST(BackendNdl, VideoRuntimeStatsPreserveFullDurationRange) {
+    fake_reset();
+    BackendNdlApi api = fake_api_full();
+    BackendNdlHandle ctx(open_test_backend(&api));
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, nullptr), BACKEND_NDL_OK);
+
+    backend_ndl_test_record_video_runtime(ctx.get(), UINT32_MAX, false);
+    BackendNdlRuntimeStats stats{};
+    ASSERT_EQ(backend_ndl_get_runtime_stats(ctx.get(), &stats), BACKEND_NDL_OK);
+    EXPECT_EQ(stats.video_play_samples, 1u);
+    EXPECT_EQ(stats.video_play_us_ewma, UINT32_MAX);
+    EXPECT_EQ(stats.video_play_us_max, UINT32_MAX);
+    EXPECT_EQ(stats.video_play_errors, 0u);
+
+    ASSERT_EQ(backend_ndl_reload(ctx.get()), BACKEND_NDL_OK);
+    backend_ndl_test_record_video_runtime(ctx.get(), 0, false);
+    ASSERT_EQ(backend_ndl_get_runtime_stats(ctx.get(), &stats), BACKEND_NDL_OK);
+    EXPECT_EQ(stats.video_play_samples, 1u);
+    EXPECT_EQ(stats.video_play_us_ewma, 0u);
+    EXPECT_EQ(stats.video_play_us_max, 0u);
+}
+
+TEST(BackendNdl, VideoCadenceLogIncludesQueueAndPlayCallTelemetry) {
+    fake_reset();
+    BackendNdlApi api = fake_api_full();
+    BackendNdlConfig config = test_config();
+    Capture capture{};
+    config.log_fn = capture_log;
+    config.userdata = &capture;
+    config.minimum_log_level = BACKEND_NDL_LOG_DEBUG;
+    BackendNdlHandle ctx(backend_ndl_open_with_api(
+        &config, BACKEND_NDL_ABI_V2_WINDOW_ID_INIT, &api));
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, nullptr), BACKEND_NDL_OK);
+
+    for (unsigned int i = 0; i < 300; i++) {
+        ASSERT_EQ(backend_ndl_feed_video(ctx.get(), k_data, 16, (long long)i, i == 0),
+                  BACKEND_NDL_OK);
+    }
+
+    EXPECT_EQ(g_fake.video_play_calls, 300);
+    EXPECT_EQ(g_fake.video_queue_calls, 1);
+    EXPECT_EQ(capture.video_sink_logs, 1);
+    EXPECT_NE(strstr(capture.video_sink_log, "fed=300 render_queue=3"), nullptr);
+    EXPECT_NE(strstr(capture.video_sink_log, "play_calls=300"), nullptr);
+    EXPECT_NE(strstr(capture.video_sink_log, "play_us_ewma="), nullptr);
+    EXPECT_NE(strstr(capture.video_sink_log, "play_us_max="), nullptr);
+    EXPECT_NE(strstr(capture.video_sink_log, "play_errors=0"), nullptr);
+}
+
 TEST(BackendNdl, FailedMediaUnloadKeepsPreviousTracksReady) {
     fake_reset();
     BackendNdlApi api = fake_api_full();
@@ -839,6 +1026,9 @@ TEST(BackendNdl, FailedMediaUnloadKeepsPreviousTracksReady) {
     ASSERT_NE(ctx, nullptr);
     ASSERT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, &k_stereo), BACKEND_NDL_OK);
     ASSERT_EQ(backend_ndl_feed_video(ctx.get(), k_data, 16, 0, true), BACKEND_NDL_OK);
+    BackendNdlRuntimeStats stats{};
+    ASSERT_EQ(backend_ndl_get_runtime_stats(ctx.get(), &stats), BACKEND_NDL_OK);
+    ASSERT_EQ(stats.video_play_samples, 1u);
 
     int load_calls = g_fake.load_calls;
     g_fake.fail_unload = true;
@@ -846,11 +1036,15 @@ TEST(BackendNdl, FailedMediaUnloadKeepsPreviousTracksReady) {
     EXPECT_EQ(g_fake.load_calls, load_calls);
     EXPECT_EQ(backend_ndl_feed_video(ctx.get(), k_data, 16, 0, false), BACKEND_NDL_OK);
     EXPECT_EQ(backend_ndl_feed_audio(ctx.get(), k_data, 16, 0), BACKEND_NDL_OK);
+    ASSERT_EQ(backend_ndl_get_runtime_stats(ctx.get(), &stats), BACKEND_NDL_OK);
+    EXPECT_EQ(stats.video_play_samples, 2u);
 
     g_fake.fail_unload = false;
     EXPECT_EQ(backend_ndl_set_media(ctx.get(), &k_h264, nullptr), BACKEND_NDL_OK);
     EXPECT_EQ(g_fake.load_calls, load_calls + 1);
     EXPECT_EQ(backend_ndl_feed_audio(ctx.get(), k_data, 16, 0), BACKEND_NDL_NOT_READY);
+    ASSERT_EQ(backend_ndl_get_runtime_stats(ctx.get(), &stats), BACKEND_NDL_OK);
+    EXPECT_EQ(stats.video_play_samples, 0u);
 }
 
 TEST(BackendNdl, FailedEffectUnloadKeepsPreviousEffectReady) {

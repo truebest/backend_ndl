@@ -56,6 +56,10 @@ BackendNdl *backend_ndl_open_with_api(const BackendNdlConfig *config,
                                       BackendNdlAbiProfile profile,
                                       const BackendNdlApi *api);
 void backend_ndl_test_force_process_symbols(bool enabled);
+void backend_ndl_test_set_after_video_stats_begin(void (*hook)(BackendNdl *));
+void backend_ndl_test_record_video_runtime(BackendNdl *ctx,
+                                           uint32_t elapsed_us,
+                                           bool failed);
 #endif
 
 #ifdef __cplusplus

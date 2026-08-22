@@ -65,6 +65,20 @@ struct BackendNdl {
     _Atomic unsigned int audio_not_ready_streak;
     _Atomic unsigned int audio_error_streak;
     _Atomic unsigned int video_error_streak;
+    /* Runtime-stat fields pack a load-epoch tag with each metric. EWMA also
+     * carries an initialized bit so zero and the full uint32_t duration range
+     * stay representable. Writers from an older load can therefore finish
+     * without delaying reset or contaminating the new load. */
+    _Atomic unsigned long long video_play_samples;
+    _Atomic unsigned long long video_play_us_ewma;
+    _Atomic unsigned long long video_play_us_max;
+    _Atomic unsigned long long video_play_errors;
+    /* A successful media load publishes a new tagged epoch without waiting for
+     * feed threads. The writer count and completion version make snapshots
+     * coherent while allowing multiple feeds to record concurrently. */
+    _Atomic unsigned long long video_stats_epoch;
+    _Atomic unsigned long long video_stats_writers;
+    _Atomic unsigned long long video_stats_version;
     _Atomic int multichannel_status;
 };
 
@@ -80,6 +94,7 @@ void backend_ndl_log(BackendNdl *ctx, BackendNdlLogLevel level, const char *form
 bool backend_ndl_log_enabled(const BackendNdl *ctx, BackendNdlLogLevel level);
 const char *backend_ndl_last_error(const BackendNdl *ctx);
 long long backend_ndl_monotonic_ms(void);
+long long backend_ndl_monotonic_us(void);
 long long backend_ndl_media_time_for_state(const BackendNdl *ctx, uint64_t state);
 uint64_t backend_ndl_feed_generation(uint64_t state);
 BackendNdlResult backend_ndl_opt_get_int(BackendNdl *ctx, int (*fn)(int *), int *out);
@@ -102,8 +117,10 @@ BackendNdlResult backend_ndl_video_fill_media_info(BackendNdlAbiProfile profile,
                                                    const BackendNdlVideoInfo *video,
                                                    BackendNdlMediaInfo *out);
 BackendNdlResult backend_ndl_audio_after_load_locked(BackendNdl *ctx);
+void backend_ndl_video_before_load_locked(BackendNdl *ctx);
 void backend_ndl_video_after_load_locked(BackendNdl *ctx);
 BackendNdlResult backend_ndl_effect_unload_locked(BackendNdl *ctx);
+void backend_ndl_video_reset_runtime_stats(BackendNdl *ctx);
 void backend_ndl_audio_register_capability_callback(BackendNdl *ctx);
 BackendNdlMultichannelStatus backend_ndl_multichannel_from_query(int value);
 BackendNdlMultichannelStatus backend_ndl_multichannel_from_callback(int value);

@@ -24,6 +24,10 @@ typedef struct BackendNdl BackendNdl;
  * feed. Feed calls never acquire the wrapper lifecycle mutex. */
 #define BACKEND_NDL_PTS_AUTO INT64_MIN
 
+/* Smallest render-queue threshold known to affect observed firmware. Values 0 and 1
+ * have been observed to return success while logging that no threshold is needed. */
+#define BACKEND_NDL_MIN_FRAME_DROP_THRESHOLD 2
+
 typedef enum BackendNdlResult {
     BACKEND_NDL_OK = 0,
     BACKEND_NDL_ERROR = 1,
@@ -121,6 +125,11 @@ typedef struct BackendNdlConfig {
     void *userdata;
     BackendNdlLogLevel minimum_log_level;
 
+    /* Best-effort firmware render-queue threshold, applied before every media load
+     * as videoRenderQueueThreshold. Values below
+     * BACKEND_NDL_MIN_FRAME_DROP_THRESHOLD are not sent. The default -1 and the
+     * public setter's accepted values 0 and 1 therefore leave threshold arming
+     * disabled. Exact queueing and drop behavior is device/firmware specific. */
     int video_frame_drop_threshold;
     bool require_keyframe_after_reload;
     bool guard_audio_overflow;
@@ -164,6 +173,16 @@ typedef struct BackendNdlHdrInfo {
     uint32_t color_primaries;
     uint32_t matrix_coeffs;
 } BackendNdlHdrInfo;
+
+/* Mutex-free coherent snapshot of synchronous DirectVideoPlay calls since the
+ * most recent successful media load. A zero sample count means the timing
+ * fields are not yet valid. */
+typedef struct BackendNdlRuntimeStats {
+    uint32_t video_play_samples;
+    uint32_t video_play_us_ewma;
+    uint32_t video_play_us_max;
+    uint32_t video_play_errors;
+} BackendNdlRuntimeStats;
 
 void backend_ndl_config_defaults(BackendNdlConfig *config);
 
@@ -212,6 +231,8 @@ BackendNdlResult backend_ndl_feed_audio(BackendNdl *ctx,
                                         long long ndl_pts);
 
 long long backend_ndl_media_time_ms(const BackendNdl *ctx);
+BackendNdlResult backend_ndl_get_runtime_stats(const BackendNdl *ctx,
+                                               BackendNdlRuntimeStats *out);
 
 BackendNdlResult backend_ndl_get_audio_available(BackendNdl *ctx, int *available_bytes);
 BackendNdlResult backend_ndl_get_audio_total(BackendNdl *ctx, int *total_bytes);
@@ -220,6 +241,9 @@ BackendNdlResult backend_ndl_get_multichannel_status(BackendNdl *ctx,
 BackendNdlResult backend_ndl_get_video_render_buffer_length(BackendNdl *ctx, int *frames);
 BackendNdlResult backend_ndl_flush_video_render_buffer(BackendNdl *ctx);
 BackendNdlResult backend_ndl_set_video_area(BackendNdl *ctx, int left, int top, int width, int height);
+/* Configure future media loads. This does not alter an already loaded pipeline;
+ * use backend_ndl_reload() to apply the new value. Values 0 and 1 disable
+ * threshold arming and are never passed to the facade. */
 BackendNdlResult backend_ndl_set_video_frame_drop_threshold(BackendNdl *ctx, int threshold);
 BackendNdlResult backend_ndl_set_video_hdr_info(BackendNdl *ctx, const BackendNdlHdrInfo *info);
 BackendNdlResult backend_ndl_set_foreground(BackendNdl *ctx, bool foreground);

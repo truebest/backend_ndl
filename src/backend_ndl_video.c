@@ -5,8 +5,23 @@
 #include "backend_ndl_internal.h"
 
 #include <limits.h>
+#include <sched.h>
 #include <stdint.h>
 #include <string.h>
+
+#define BACKEND_NDL_VIDEO_STATS_TAG_SHIFT 32u
+#define BACKEND_NDL_VIDEO_STATS_VALUE_MASK UINT64_C(0xffffffff)
+#define BACKEND_NDL_VIDEO_STATS_EWMA_TAG_SHIFT 33u
+#define BACKEND_NDL_VIDEO_STATS_EWMA_TAG_MASK UINT32_C(0x7fffffff)
+#define BACKEND_NDL_VIDEO_STATS_EWMA_INITIALIZED (UINT64_C(1) << 32u)
+
+#if defined(BACKEND_NDL_TESTING) && BACKEND_NDL_TESTING
+static void (*g_backend_ndl_test_after_video_stats_begin)(BackendNdl *);
+
+void backend_ndl_test_set_after_video_stats_begin(void (*hook)(BackendNdl *)) {
+    g_backend_ndl_test_after_video_stats_begin = hook;
+}
+#endif
 
 static NDL_DIRECTVIDEO_HDR_INFO_T backend_ndl_sdk_hdr(const BackendNdlHdrInfo *info) {
     NDL_DIRECTVIDEO_HDR_INFO_T result;
@@ -51,19 +66,31 @@ BackendNdlResult backend_ndl_video_fill_media_info(BackendNdlAbiProfile profile,
     return BACKEND_NDL_OK;
 }
 
+/* The threshold is consumed while the firmware builds the media-load payload as
+ * option.externalStreamingInfo.contents.esInfo.videoRenderQueueThreshold. It must
+ * therefore be set before every load: the observed implementation clears its
+ * "threshold set" flag on unload. Values <= 1 are an observed no-op (with a debug
+ * message despite a successful return), so the smallest known effective value is 2.
+ * The exact queueing and frame-drop behavior remains firmware/device specific. */
+void backend_ndl_video_before_load_locked(BackendNdl *ctx) {
+    if (ctx->config.video_frame_drop_threshold < BACKEND_NDL_MIN_FRAME_DROP_THRESHOLD ||
+        !ctx->api.DirectVideoSetFrameDropThreshold) {
+        return;
+    }
+    int rc = ctx->api.DirectVideoSetFrameDropThreshold(ctx->config.video_frame_drop_threshold);
+    if (rc != 0) {
+        BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_WARN,
+                        "NDL_DirectVideoSetFrameDropThreshold(%d) failed rc=%d error=%s",
+                        ctx->config.video_frame_drop_threshold, rc,
+                        backend_ndl_last_error(ctx));
+        return;
+    }
+    BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO, "video render queue threshold armed: %d",
+                    ctx->config.video_frame_drop_threshold);
+}
+
 void backend_ndl_video_after_load_locked(BackendNdl *ctx) {
     if (!ctx->media.has_video) return;
-    if (ctx->config.video_frame_drop_threshold >= 0 &&
-        ctx->api.DirectVideoSetFrameDropThreshold) {
-        int rc = ctx->api.DirectVideoSetFrameDropThreshold(
-            ctx->config.video_frame_drop_threshold);
-        if (rc != 0) {
-            BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_WARN,
-                            "NDL_DirectVideoSetFrameDropThreshold(%d) failed rc=%d error=%s",
-                            ctx->config.video_frame_drop_threshold, rc,
-                            backend_ndl_last_error(ctx));
-        }
-    }
     if (ctx->has_video_area && ctx->api.DirectVideoSetArea) {
         int rc = ctx->api.DirectVideoSetArea(ctx->video_left, ctx->video_top,
                                              ctx->video_width, ctx->video_height);
@@ -89,6 +116,211 @@ static bool backend_ndl_video_state_ready(uint64_t initial, uint64_t current) {
            (current & BACKEND_NDL_FEED_VIDEO_READY) != 0;
 }
 
+static uint32_t backend_ndl_video_stats_tag(unsigned long long epoch) {
+    return (uint32_t)epoch;
+}
+
+static unsigned long long backend_ndl_video_stats_pack(uint32_t tag, uint32_t value) {
+    return ((unsigned long long)tag << BACKEND_NDL_VIDEO_STATS_TAG_SHIFT) | value;
+}
+
+static uint32_t backend_ndl_video_stats_packed_tag(unsigned long long value) {
+    return (uint32_t)(value >> BACKEND_NDL_VIDEO_STATS_TAG_SHIFT);
+}
+
+static uint32_t backend_ndl_video_stats_packed_value(unsigned long long value) {
+    return (uint32_t)(value & BACKEND_NDL_VIDEO_STATS_VALUE_MASK);
+}
+
+static unsigned long long backend_ndl_video_stats_pack_ewma(uint32_t tag,
+                                                            bool initialized,
+                                                            uint32_t value) {
+    return ((unsigned long long)(tag & BACKEND_NDL_VIDEO_STATS_EWMA_TAG_MASK)
+            << BACKEND_NDL_VIDEO_STATS_EWMA_TAG_SHIFT) |
+           (initialized ? BACKEND_NDL_VIDEO_STATS_EWMA_INITIALIZED : 0) | value;
+}
+
+static uint32_t backend_ndl_video_stats_ewma_tag(unsigned long long value) {
+    return (uint32_t)(value >> BACKEND_NDL_VIDEO_STATS_EWMA_TAG_SHIFT);
+}
+
+static bool backend_ndl_video_stats_writer_begin(BackendNdl *ctx, uint32_t tag) {
+    unsigned long long observed =
+        atomic_load_explicit(&ctx->video_stats_writers, memory_order_acquire);
+    for (;;) {
+        if (backend_ndl_video_stats_packed_tag(observed) != tag) {
+            return false;
+        }
+        uint32_t writers = backend_ndl_video_stats_packed_value(observed);
+        if (writers == UINT32_MAX) {
+            return false;
+        }
+        unsigned long long desired = backend_ndl_video_stats_pack(tag, writers + 1u);
+        if (atomic_compare_exchange_weak_explicit(
+                &ctx->video_stats_writers, &observed, desired, memory_order_acq_rel,
+                memory_order_acquire)) {
+            return true;
+        }
+    }
+}
+
+static void backend_ndl_video_stats_increment(_Atomic unsigned long long *field,
+                                              uint32_t tag,
+                                              bool saturate,
+                                              memory_order success_order) {
+    unsigned long long observed = atomic_load_explicit(field, memory_order_relaxed);
+    for (;;) {
+        if (backend_ndl_video_stats_packed_tag(observed) != tag) {
+            return;
+        }
+        uint32_t value = backend_ndl_video_stats_packed_value(observed);
+        if (saturate && value == UINT32_MAX) {
+            return;
+        }
+        unsigned long long desired = backend_ndl_video_stats_pack(tag, value + 1u);
+        if (atomic_compare_exchange_weak_explicit(field, &observed, desired,
+                                                  success_order,
+                                                  memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+static void backend_ndl_video_stats_update_ewma(BackendNdl *ctx,
+                                                uint32_t tag,
+                                                uint32_t sample_us) {
+    unsigned long long observed =
+        atomic_load_explicit(&ctx->video_play_us_ewma, memory_order_relaxed);
+    for (;;) {
+        if (backend_ndl_video_stats_ewma_tag(observed) !=
+            (tag & BACKEND_NDL_VIDEO_STATS_EWMA_TAG_MASK)) {
+            return;
+        }
+        bool initialized =
+            (observed & BACKEND_NDL_VIDEO_STATS_EWMA_INITIALIZED) != 0;
+        uint32_t ewma = backend_ndl_video_stats_packed_value(observed);
+        uint32_t next;
+        if (!initialized) {
+            next = sample_us;
+        } else if (sample_us >= ewma) {
+            uint32_t difference = sample_us - ewma;
+            uint32_t step = difference / 8u + (difference % 8u != 0);
+            next = ewma + step;
+        } else {
+            uint32_t difference = ewma - sample_us;
+            uint32_t step = difference / 8u + (difference % 8u != 0);
+            next = ewma - step;
+        }
+        unsigned long long desired = backend_ndl_video_stats_pack_ewma(tag, true, next);
+        if (atomic_compare_exchange_weak_explicit(
+                &ctx->video_play_us_ewma, &observed, desired,
+                memory_order_relaxed, memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+static void backend_ndl_video_stats_update_max(BackendNdl *ctx,
+                                               uint32_t tag,
+                                               uint32_t sample_us) {
+    unsigned long long observed =
+        atomic_load_explicit(&ctx->video_play_us_max, memory_order_relaxed);
+    for (;;) {
+        if (backend_ndl_video_stats_packed_tag(observed) != tag ||
+            backend_ndl_video_stats_packed_value(observed) >= sample_us) {
+            return;
+        }
+        unsigned long long desired = backend_ndl_video_stats_pack(tag, sample_us);
+        if (atomic_compare_exchange_weak_explicit(&ctx->video_play_us_max, &observed,
+                                                  desired, memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+static void backend_ndl_video_stats_writer_end(BackendNdl *ctx, uint32_t tag) {
+    backend_ndl_video_stats_increment(&ctx->video_stats_version, tag, false,
+                                      memory_order_release);
+
+    unsigned long long observed =
+        atomic_load_explicit(&ctx->video_stats_writers, memory_order_relaxed);
+    for (;;) {
+        if (backend_ndl_video_stats_packed_tag(observed) != tag) {
+            return;
+        }
+        uint32_t writers = backend_ndl_video_stats_packed_value(observed);
+        if (writers == 0) {
+            return;
+        }
+        unsigned long long desired = backend_ndl_video_stats_pack(tag, writers - 1u);
+        if (atomic_compare_exchange_weak_explicit(
+                &ctx->video_stats_writers, &observed, desired, memory_order_acq_rel,
+                memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+void backend_ndl_video_reset_runtime_stats(BackendNdl *ctx) {
+    unsigned long long epoch =
+        atomic_load_explicit(&ctx->video_stats_epoch, memory_order_relaxed);
+    unsigned long long next_epoch = epoch == ULLONG_MAX ? 1 : epoch + 1;
+    uint32_t tag = backend_ndl_video_stats_tag(next_epoch);
+    unsigned long long empty = backend_ndl_video_stats_pack(tag, 0);
+
+    /* Publish the writer tag first so an old writer either finishes before
+     * these stores or sees the new tag and abandons its update. New writers do
+     * not observe next_epoch until the final release store. */
+    atomic_store_explicit(&ctx->video_stats_writers, empty, memory_order_relaxed);
+    atomic_store_explicit(&ctx->video_stats_version, empty, memory_order_relaxed);
+    atomic_store_explicit(&ctx->video_play_samples, empty, memory_order_relaxed);
+    atomic_store_explicit(&ctx->video_play_us_ewma,
+                          backend_ndl_video_stats_pack_ewma(tag, false, 0),
+                          memory_order_relaxed);
+    atomic_store_explicit(&ctx->video_play_us_max, empty, memory_order_relaxed);
+    atomic_store_explicit(&ctx->video_play_errors, empty, memory_order_relaxed);
+    atomic_store_explicit(&ctx->video_stats_epoch, next_epoch, memory_order_release);
+}
+
+static void backend_ndl_video_record_runtime(BackendNdl *ctx,
+                                             unsigned long long expected_epoch,
+                                             long long elapsed_us,
+                                             bool failed) {
+    uint32_t tag = backend_ndl_video_stats_tag(expected_epoch);
+    if (!backend_ndl_video_stats_writer_begin(ctx, tag)) {
+        return;
+    }
+
+#if defined(BACKEND_NDL_TESTING) && BACKEND_NDL_TESTING
+    if (g_backend_ndl_test_after_video_stats_begin) {
+        g_backend_ndl_test_after_video_stats_begin(ctx);
+    }
+#endif
+
+    unsigned long long sample = elapsed_us > 0 ? (unsigned long long)elapsed_us : 0;
+    uint32_t bounded_sample = sample > UINT32_MAX ? UINT32_MAX : (uint32_t)sample;
+    backend_ndl_video_stats_update_ewma(ctx, tag, bounded_sample);
+    backend_ndl_video_stats_update_max(ctx, tag, bounded_sample);
+    if (failed) {
+        backend_ndl_video_stats_increment(&ctx->video_play_errors, tag, true,
+                                          memory_order_relaxed);
+    }
+    backend_ndl_video_stats_increment(&ctx->video_play_samples, tag, true,
+                                      memory_order_relaxed);
+    backend_ndl_video_stats_writer_end(ctx, tag);
+}
+
+#if defined(BACKEND_NDL_TESTING) && BACKEND_NDL_TESTING
+void backend_ndl_test_record_video_runtime(BackendNdl *ctx,
+                                           uint32_t elapsed_us,
+                                           bool failed) {
+    unsigned long long epoch =
+        atomic_load_explicit(&ctx->video_stats_epoch, memory_order_acquire);
+    backend_ndl_video_record_runtime(ctx, epoch, elapsed_us, failed);
+}
+#endif
+
 BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
                                         const void *data,
                                         size_t len,
@@ -112,6 +344,8 @@ BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
         ndl_pts = backend_ndl_media_time_for_state(ctx, state);
     }
 
+    unsigned long long stats_epoch =
+        atomic_load_explicit(&ctx->video_stats_epoch, memory_order_acquire);
     uint64_t before_play = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
     if (!backend_ndl_video_state_ready(state, before_play)) {
         return (before_play & BACKEND_NDL_FEED_VIDEO_READY) != 0
@@ -119,7 +353,11 @@ BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
                    : BACKEND_NDL_NOT_READY;
     }
 
+    long long started_us = backend_ndl_monotonic_us();
     int rc = ctx->api.DirectVideoPlay((void *)data, (unsigned int)len, ndl_pts);
+    long long finished_us = backend_ndl_monotonic_us();
+    backend_ndl_video_record_runtime(ctx, stats_epoch, finished_us - started_us,
+                                     rc != 0);
     uint64_t after_play = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
     if (!backend_ndl_video_state_ready(state, after_play)) {
         return (after_play & BACKEND_NDL_FEED_VIDEO_READY) != 0
@@ -155,14 +393,88 @@ BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
     unsigned long long count = atomic_fetch_add_explicit(&ctx->video_feed_count, 1,
                                                           memory_order_relaxed) + 1;
     if (backend_ndl_log_enabled(ctx, BACKEND_NDL_LOG_DEBUG) &&
-        count % BACKEND_NDL_VIDEO_DEBUG_CADENCE == 0 &&
-        ctx->api.DirectVideoGetRenderBufferLength) {
+        count % BACKEND_NDL_VIDEO_DEBUG_CADENCE == 0) {
         int depth = -1;
-        if (ctx->api.DirectVideoGetRenderBufferLength(&depth) == 0) {
-            BACKEND_NDL_DEBUG_LOG(ctx, "video sink: fed=%llu render_queue=%d pts=%lld",
-                                  count, depth, ndl_pts);
+        if (ctx->api.DirectVideoGetRenderBufferLength) {
+            (void)ctx->api.DirectVideoGetRenderBufferLength(&depth);
         }
+        BackendNdlRuntimeStats stats;
+        (void)backend_ndl_get_runtime_stats(ctx, &stats);
+        BACKEND_NDL_DEBUG_LOG(
+            ctx,
+            "video sink: fed=%llu render_queue=%d pts=%lld play_calls=%u "
+            "play_us_ewma=%u play_us_max=%u play_errors=%u",
+            count, depth, ndl_pts, stats.video_play_samples, stats.video_play_us_ewma,
+            stats.video_play_us_max, stats.video_play_errors);
     }
+    return BACKEND_NDL_OK;
+}
+
+BackendNdlResult backend_ndl_get_runtime_stats(const BackendNdl *ctx,
+                                               BackendNdlRuntimeStats *out) {
+    if (!ctx || !out) {
+        return BACKEND_NDL_INVALID_ARGUMENT;
+    }
+
+    uint32_t samples;
+    uint32_t ewma;
+    uint32_t maximum;
+    uint32_t errors;
+    for (;;) {
+        unsigned long long epoch =
+            atomic_load_explicit(&ctx->video_stats_epoch, memory_order_acquire);
+        uint32_t tag = backend_ndl_video_stats_tag(epoch);
+        unsigned long long writers_before =
+            atomic_load_explicit(&ctx->video_stats_writers, memory_order_acquire);
+        unsigned long long version_before =
+            atomic_load_explicit(&ctx->video_stats_version, memory_order_acquire);
+        if (backend_ndl_video_stats_packed_tag(writers_before) != tag ||
+            backend_ndl_video_stats_packed_value(writers_before) != 0 ||
+            backend_ndl_video_stats_packed_tag(version_before) != tag) {
+            sched_yield();
+            continue;
+        }
+
+        unsigned long long packed_samples =
+            atomic_load_explicit(&ctx->video_play_samples, memory_order_relaxed);
+        unsigned long long packed_ewma =
+            atomic_load_explicit(&ctx->video_play_us_ewma, memory_order_relaxed);
+        unsigned long long packed_maximum =
+            atomic_load_explicit(&ctx->video_play_us_max, memory_order_relaxed);
+        unsigned long long packed_errors =
+            atomic_load_explicit(&ctx->video_play_errors, memory_order_relaxed);
+        if (backend_ndl_video_stats_packed_tag(packed_samples) != tag ||
+            backend_ndl_video_stats_ewma_tag(packed_ewma) !=
+                (tag & BACKEND_NDL_VIDEO_STATS_EWMA_TAG_MASK) ||
+            backend_ndl_video_stats_packed_tag(packed_maximum) != tag ||
+            backend_ndl_video_stats_packed_tag(packed_errors) != tag) {
+            continue;
+        }
+        /* Keep the snapshot reads before writer/version validation on ARM. */
+        atomic_thread_fence(memory_order_acquire);
+        unsigned long long writers_after =
+            atomic_load_explicit(&ctx->video_stats_writers, memory_order_acquire);
+        unsigned long long version_after =
+            atomic_load_explicit(&ctx->video_stats_version, memory_order_acquire);
+        unsigned long long epoch_after =
+            atomic_load_explicit(&ctx->video_stats_epoch, memory_order_acquire);
+        if (epoch != epoch_after || version_before != version_after ||
+            writers_before != writers_after) {
+            continue;
+        }
+
+        samples = backend_ndl_video_stats_packed_value(packed_samples);
+        ewma = (packed_ewma & BACKEND_NDL_VIDEO_STATS_EWMA_INITIALIZED) != 0
+                   ? backend_ndl_video_stats_packed_value(packed_ewma)
+                   : 0;
+        maximum = backend_ndl_video_stats_packed_value(packed_maximum);
+        errors = backend_ndl_video_stats_packed_value(packed_errors);
+        break;
+    }
+    out->video_play_samples = samples;
+    out->video_play_us_ewma = ewma;
+    out->video_play_us_max = maximum;
+    out->video_play_errors = errors;
     return BACKEND_NDL_OK;
 }
 
@@ -204,12 +516,8 @@ BackendNdlResult backend_ndl_set_video_frame_drop_threshold(BackendNdl *ctx, int
     if (!ctx->api.DirectVideoSetFrameDropThreshold) return BACKEND_NDL_UNAVAILABLE;
     pthread_mutex_lock(&ctx->lifecycle_lock);
     ctx->config.video_frame_drop_threshold = threshold;
-    int rc = 0;
-    if (ctx->media_loaded && ctx->media.has_video) {
-        rc = ctx->api.DirectVideoSetFrameDropThreshold(threshold);
-    }
     pthread_mutex_unlock(&ctx->lifecycle_lock);
-    return rc == 0 ? BACKEND_NDL_OK : BACKEND_NDL_ERROR;
+    return BACKEND_NDL_OK;
 }
 
 BackendNdlResult backend_ndl_set_video_hdr_info(BackendNdl *ctx,

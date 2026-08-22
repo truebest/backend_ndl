@@ -92,6 +92,9 @@ TSAN_OPTIONS=halt_on_error=1 \
   raw Opus packets. The independent DirectEffect API remains PCM-only.
 - `backend_ndl_feed_audio()` and `backend_ndl_feed_video()` acquire no wrapper
   mutex. Audio and video may run concurrently and may cross reload/unload.
+- `backend_ndl_get_runtime_stats()` returns a mutex-free coherent snapshot of
+  video-feed call count, errors, and `DirectVideoPlay` EWMA/max wall time. The
+  counters reset after every successful combined media load.
 - A C11 atomic generation snapshot keeps readiness, AUTO PTS and the keyframe
   gate coherent. A crossed generation is returned as transient
   `NOT_READY`/`NEED_KEYFRAME`.

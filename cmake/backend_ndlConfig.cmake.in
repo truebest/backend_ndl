@@ -2,6 +2,12 @@
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
+set(backend_ndl_WITH_GSTREAMER @BACKEND_NDL_WITH_GSTREAMER@)
+if(backend_ndl_WITH_GSTREAMER)
+  find_dependency(PkgConfig)
+  pkg_check_modules(BACKEND_NDL_GST REQUIRED IMPORTED_TARGET
+    gstreamer-1.0>=1.18 gstreamer-app-1.0>=1.18)
+endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/backend_ndlTargets.cmake")
 check_required_components(backend_ndl)

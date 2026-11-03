@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.19)
 
-set(BACKEND_NDL_VERSION 0.5.0)
+set(BACKEND_NDL_VERSION 0.6.0)
 
 if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
   project(backend_ndl VERSION ${BACKEND_NDL_VERSION} LANGUAGES C)
@@ -11,6 +11,8 @@ else()
 endif()
 
 include(GNUInstallDirs)
+
+option(BACKEND_NDL_WITH_GSTREAMER "Enable private firmware GStreamer integration" OFF)
 
 option(BACKEND_NDL_BUILD_TESTS "Build backend_ndl host tests" ${BUILD_TESTING})
 option(BACKEND_NDL_INSTALL "Install backend_ndl development files" ${BACKEND_NDL_TOP_LEVEL})
@@ -64,6 +66,7 @@ set(BACKEND_NDL_SOURCES
   src/backend_ndl.c
   src/backend_ndl_audio.c
   src/backend_ndl_video.c
+  src/backend_ndl_gstreamer.c
 )
 
 add_library(backend_ndl STATIC ${BACKEND_NDL_SOURCES})
@@ -88,6 +91,28 @@ if(UNIX AND NOT APPLE)
   target_link_libraries(backend_ndl PRIVATE rt)
 endif()
 
+if(BACKEND_NDL_WITH_GSTREAMER)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(BACKEND_NDL_GST REQUIRED IMPORTED_TARGET
+    gstreamer-1.0>=1.18 gstreamer-app-1.0>=1.18)
+endif()
+
+function(backend_ndl_configure_gstreamer target)
+  if(BACKEND_NDL_WITH_GSTREAMER)
+    target_compile_definitions(${target} PRIVATE BACKEND_NDL_WITH_GSTREAMER=1)
+    target_link_libraries(${target} PRIVATE PkgConfig::BACKEND_NDL_GST)
+    # These hooks must also be visible to libraries loaded later by the facade.
+    target_link_options(${target} INTERFACE
+      -Wl,--export-dynamic-symbol=g_object_set
+      -Wl,--export-dynamic-symbol=gst_app_src_push_buffer
+      -Wl,--export-dynamic-symbol=gst_pipeline_new
+      -Wl,--export-dynamic-symbol=gst_element_factory_make
+      -Wl,--export-dynamic-symbol=gst_element_factory_create
+      -Wl,--export-dynamic-symbol=gst_bus_post)
+  endif()
+endfunction()
+backend_ndl_configure_gstreamer(backend_ndl)
+
 if(BACKEND_NDL_BUILD_TESTS)
   add_library(backend_ndl_test_support STATIC ${BACKEND_NDL_SOURCES})
   add_library(backend_ndl::test_support ALIAS backend_ndl_test_support)
@@ -96,6 +121,7 @@ if(BACKEND_NDL_BUILD_TESTS)
     C_STANDARD_REQUIRED YES
     C_EXTENSIONS YES
   )
+  backend_ndl_configure_gstreamer(backend_ndl_test_support)
   target_compile_definitions(backend_ndl_test_support PUBLIC BACKEND_NDL_TESTING=1)
   target_include_directories(backend_ndl_test_support
     PUBLIC include src
@@ -105,12 +131,23 @@ if(BACKEND_NDL_BUILD_TESTS)
     target_link_libraries(backend_ndl_test_support PUBLIC rt)
   endif()
 
+  if(BACKEND_NDL_WITH_GSTREAMER)
+    add_executable(test-backend-ndl-gstreamer tests/test_gstreamer.c)
+    target_compile_definitions(test-backend-ndl-gstreamer PRIVATE BACKEND_NDL_WITH_GSTREAMER=1)
+    target_link_libraries(test-backend-ndl-gstreamer PRIVATE
+      backend_ndl::test_support PkgConfig::BACKEND_NDL_GST)
+    add_test(NAME backend-ndl-gstreamer COMMAND test-backend-ndl-gstreamer)
+    set_tests_properties(backend-ndl-gstreamer PROPERTIES TIMEOUT 30)
+  endif()
+
   if(BACKEND_NDL_BUILD_GTESTS)
     enable_language(CXX)
     find_package(GTest REQUIRED)
     include(GoogleTest)
 
     add_executable(test-backend-ndl tests/test_backend_ndl.cpp)
+    target_compile_definitions(test-backend-ndl PRIVATE
+      BACKEND_NDL_TEST_HAS_GSTREAMER=$<BOOL:${BACKEND_NDL_WITH_GSTREAMER}>)
     target_link_libraries(test-backend-ndl PRIVATE backend_ndl::test_support GTest::gtest_main)
     gtest_discover_tests(test-backend-ndl TEST_PREFIX "backend-ndl.")
 

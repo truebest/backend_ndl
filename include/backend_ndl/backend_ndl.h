@@ -20,6 +20,57 @@ extern "C" {
 
 typedef struct BackendNdl BackendNdl;
 
+/* DEFAULT preserves firmware behavior. Explicit profiles require the
+ * optional GStreamer module and are part of the media load configuration. */
+typedef enum BackendNdlAppType {
+    BACKEND_NDL_APP_DEFAULT = 0,
+    BACKEND_NDL_APP_RTC,
+    BACKEND_NDL_APP_MIRACAST,
+    BACKEND_NDL_APP_ATSC3,
+    BACKEND_NDL_APP_CAMERA,
+    BACKEND_NDL_APP_JP4K,
+    BACKEND_NDL_APP_AIRPLAY,
+    BACKEND_NDL_APP_DIRECTMEDIA,
+    BACKEND_NDL_APP_APPCAST,
+    BACKEND_NDL_APP_R2R,
+    BACKEND_NDL_APP_SYE
+} BackendNdlAppType;
+
+enum BackendNdlVideoFlags {
+    BACKEND_NDL_VIDEO_DECODE_ONLY = 1u << 0,
+    BACKEND_NDL_VIDEO_CONFIG_ONLY = 1u << 1
+};
+
+typedef enum BackendNdlVideoPathState {
+    BACKEND_NDL_VIDEO_PATH_NOT_READY,
+    BACKEND_NDL_VIDEO_PATH_READY,
+    BACKEND_NDL_VIDEO_PATH_FAILED
+} BackendNdlVideoPathState;
+
+/* Generations skip zero on rollover; cumulative picture counters wrap modulo 2^32. */
+typedef struct BackendNdlVideoStatus {
+    BackendNdlVideoPathState state;
+    uint32_t generation;
+    bool supports_decode_only;
+    bool supports_frame_events;
+    uint32_t submitted, decoded, suppressed, forwarded;
+    uint32_t queued_buffers, pending_pictures, max_pending_pictures;
+    size_t queued_bytes;
+} BackendNdlVideoStatus;
+
+/* A matched decoder output, not confirmation of physical presentation. Times
+ * use the same monotonic clock; their difference includes input queueing. */
+typedef struct BackendNdlVideoFrameEvent {
+    uint32_t generation;
+    int64_t pts_ms;
+    int64_t submitted_at_us, decoded_at_us;
+    bool decode_only;
+} BackendNdlVideoFrameEvent;
+
+/* May run on streaming threads. Must be short, thread-safe and non-reentrant
+ * into this context. Event storage expires on return. No calls after close. */
+typedef void (*BackendNdlVideoFrameFn)(void *userdata, const BackendNdlVideoFrameEvent *event);
+
 /* Derive milliseconds from the successful Load generation observed by this
  * feed. Feed calls never acquire the wrapper lifecycle mutex. */
 #define BACKEND_NDL_PTS_AUTO INT64_MIN
@@ -75,25 +126,25 @@ typedef enum BackendNdlAbiProfile {
     BACKEND_NDL_ABI_V2_WINDOW_ID_INIT = 2
 } BackendNdlAbiProfile;
 
-typedef uint64_t BackendNdlCapabilities;
+typedef uint32_t BackendNdlCapabilities;
 enum BackendNdlCapability {
     /* Reserved for source compatibility. The facade owns its loader
      * lifecycle; backend_ndl never reports or invokes this capability. */
-    BACKEND_NDL_CAP_DL_LIFECYCLE = UINT64_C(1) << 0,
-    BACKEND_NDL_CAP_APP_STATE = UINT64_C(1) << 1,
-    BACKEND_NDL_CAP_WINDOW_ID = UINT64_C(1) << 2,
-    BACKEND_NDL_CAP_VIDEO_PLAY = UINT64_C(1) << 3,
-    BACKEND_NDL_CAP_VIDEO_AREA = UINT64_C(1) << 4,
-    BACKEND_NDL_CAP_VIDEO_FRAME_DROP = UINT64_C(1) << 5,
-    BACKEND_NDL_CAP_VIDEO_HDR = UINT64_C(1) << 6,
-    BACKEND_NDL_CAP_VIDEO_QUEUE_LENGTH = UINT64_C(1) << 7,
-    BACKEND_NDL_CAP_VIDEO_FLUSH = UINT64_C(1) << 8,
-    BACKEND_NDL_CAP_AUDIO_PLAY = UINT64_C(1) << 9,
-    BACKEND_NDL_CAP_AUDIO_AVAILABLE = UINT64_C(1) << 10,
-    BACKEND_NDL_CAP_AUDIO_TOTAL = UINT64_C(1) << 11,
-    BACKEND_NDL_CAP_AUDIO_MULTICHANNEL_QUERY = UINT64_C(1) << 12,
-    BACKEND_NDL_CAP_AUDIO_MULTICHANNEL_CALLBACK = UINT64_C(1) << 13,
-    BACKEND_NDL_CAP_EFFECT = UINT64_C(1) << 14
+    BACKEND_NDL_CAP_DL_LIFECYCLE = UINT32_C(1) << 0,
+    BACKEND_NDL_CAP_APP_STATE = UINT32_C(1) << 1,
+    BACKEND_NDL_CAP_WINDOW_ID = UINT32_C(1) << 2,
+    BACKEND_NDL_CAP_VIDEO_PLAY = UINT32_C(1) << 3,
+    BACKEND_NDL_CAP_VIDEO_AREA = UINT32_C(1) << 4,
+    BACKEND_NDL_CAP_VIDEO_FRAME_DROP = UINT32_C(1) << 5,
+    BACKEND_NDL_CAP_VIDEO_HDR = UINT32_C(1) << 6,
+    BACKEND_NDL_CAP_VIDEO_QUEUE_LENGTH = UINT32_C(1) << 7,
+    BACKEND_NDL_CAP_VIDEO_FLUSH = UINT32_C(1) << 8,
+    BACKEND_NDL_CAP_AUDIO_PLAY = UINT32_C(1) << 9,
+    BACKEND_NDL_CAP_AUDIO_AVAILABLE = UINT32_C(1) << 10,
+    BACKEND_NDL_CAP_AUDIO_TOTAL = UINT32_C(1) << 11,
+    BACKEND_NDL_CAP_AUDIO_MULTICHANNEL_QUERY = UINT32_C(1) << 12,
+    BACKEND_NDL_CAP_AUDIO_MULTICHANNEL_CALLBACK = UINT32_C(1) << 13,
+    BACKEND_NDL_CAP_EFFECT = UINT32_C(1) << 14
 };
 
 /* Callbacks are synchronous and may run concurrently on firmware/feed
@@ -135,12 +186,14 @@ typedef struct BackendNdlConfig {
     bool guard_audio_overflow;
     /* Prime configured PCM or Opus after each successful media load. */
     bool prime_pcm_after_load;
+    BackendNdlVideoFrameFn video_frame_fn;
 } BackendNdlConfig;
 
 typedef struct BackendNdlVideoInfo {
     BackendNdlVideoCodec codec;
     uint32_t width;
     uint32_t height;
+    BackendNdlAppType app_type;
 } BackendNdlVideoInfo;
 
 typedef struct BackendNdlPcmInfo {
@@ -153,6 +206,7 @@ typedef struct BackendNdlAudioInfo {
     BackendNdlAudioCodec codec;
     uint32_t sample_rate_hz;
     uint16_t channels;
+    BackendNdlAppType app_type;
 } BackendNdlAudioInfo;
 
 /* Exact field order of the target DirectVideo HDR value parameter. */
@@ -218,13 +272,21 @@ BackendNdlResult backend_ndl_set_media(BackendNdl *ctx,
 BackendNdlResult backend_ndl_unload(BackendNdl *ctx);
 BackendNdlResult backend_ndl_reload(BackendNdl *ctx);
 
-/* Audio and video feeds may execute concurrently and take no wrapper mutex.
+/* Audio and video feeds may execute concurrently and never take the lifecycle mutex.
  * Callers retain ordering responsibility within each individual track. */
 BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
                                         const void *data,
                                         size_t len,
                                         long long ndl_pts,
                                         bool is_keyframe);
+/* CONFIG_ONLY expects no image and cannot accompany DECODE_ONLY or is_keyframe.
+ * With output tracking enabled, parameter-only AUs must use this function.
+ * Unknown flags are invalid; unsupported DECODE_ONLY is rejected. */
+BackendNdlResult backend_ndl_feed_video_ex(BackendNdl *ctx, const void *data, size_t len,
+                                           long long ndl_pts, bool is_keyframe,
+                                           uint32_t flags);
+BackendNdlResult backend_ndl_get_video_status(const BackendNdl *ctx,
+                                              BackendNdlVideoStatus *out);
 BackendNdlResult backend_ndl_feed_audio(BackendNdl *ctx,
                                         const void *data,
                                         size_t len,

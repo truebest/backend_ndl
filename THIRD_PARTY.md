@@ -18,3 +18,8 @@ At runtime the wrapper dlopens the `libNDL_directmedia.so.1` facade supplied by
 webOS. The facade owns loading `libNDL_directmedia_impl.so.1`,
 `libplayerAPIs.so.1`, and other system dependencies. No webOS system source or
 binary is copied, linked, or redistributed by `backend_ndl`.
+
+The optional GStreamer integration links the system GStreamer/gst-app and
+GLib/GObject libraries. These libraries remain installed on the TV; their
+binaries are not bundled by backend_ndl. Their public headers are private
+implementation inputs and do not appear in the backend_ndl public API.

@@ -1,0 +1,22 @@
+image: ubuntu:24.04
+
+pipelines:
+  default:
+    - step:
+        name: Library tests, GStreamer profiles and memory checks
+        runs-on:
+          - self.hosted
+          - linux
+        script:
+          - apt-get update
+          - apt-get install -y --no-install-recommends build-essential cmake libgtest-dev pkg-config
+          - cmake -S . -B /tmp/backend-ndl-base
+          - cmake --build /tmp/backend-ndl-base -j4
+          - ctest --test-dir /tmp/backend-ndl-base --output-on-failure
+          - apt-get install -y --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base
+          - cmake -S . -B /tmp/backend-ndl-gst -DBACKEND_NDL_WITH_GSTREAMER=ON
+          - cmake --build /tmp/backend-ndl-gst -j4
+          - ctest --test-dir /tmp/backend-ndl-gst --output-on-failure
+          - cmake -S . -B /tmp/backend-ndl-memory -DBACKEND_NDL_WITH_GSTREAMER=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          - cmake --build /tmp/backend-ndl-memory -j4
+          - ctest --test-dir /tmp/backend-ndl-memory --output-on-failure

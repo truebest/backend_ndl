@@ -228,11 +228,11 @@ long long backend_ndl_monotonic_us(void) {
     return (long long)now.tv_sec * 1000000 + now.tv_nsec / 1000;
 }
 
-uint64_t backend_ndl_feed_generation(uint64_t state) {
+uint32_t backend_ndl_feed_generation(uint32_t state) {
     return state >> BACKEND_NDL_FEED_GENERATION_SHIFT;
 }
 
-long long backend_ndl_media_time_for_state(const BackendNdl *ctx, uint64_t state) {
+long long backend_ndl_media_time_for_state(const BackendNdl *ctx, uint32_t state) {
     if (!ctx || backend_ndl_feed_generation(state) == 0 ||
         (state & (BACKEND_NDL_FEED_VIDEO_READY | BACKEND_NDL_FEED_AUDIO_READY)) == 0) {
         return 0;
@@ -425,13 +425,12 @@ static void backend_ndl_load_callback(int type, long long number, const char *te
     pthread_mutex_unlock(&g_backend_ndl_registry_lock);
 }
 
-static uint64_t backend_ndl_begin_generation_locked(BackendNdl *ctx,
-                                                    uint64_t *previous_state) {
-    const uint64_t max_generation = UINT64_MAX >> BACKEND_NDL_FEED_GENERATION_SHIFT;
+static uint32_t backend_ndl_begin_generation_locked(BackendNdl *ctx,
+                                                    uint32_t *previous_state) {
     ctx->reload_generation =
-        ctx->reload_generation >= max_generation ? 1 : ctx->reload_generation + 1;
-    uint64_t state = ctx->reload_generation << BACKEND_NDL_FEED_GENERATION_SHIFT;
-    uint64_t previous =
+        ctx->reload_generation >= BACKEND_NDL_FEED_GENERATION_MAX ? 1 : ctx->reload_generation + 1;
+    uint32_t state = ctx->reload_generation << BACKEND_NDL_FEED_GENERATION_SHIFT;
+    uint32_t previous =
         atomic_exchange_explicit(&ctx->feed_state, state, memory_order_acq_rel);
     if (previous_state) {
         *previous_state = previous;
@@ -464,9 +463,9 @@ static BackendNdlResult backend_ndl_build_media_info(
     return BACKEND_NDL_OK;
 }
 
-static uint64_t backend_ndl_loaded_feed_flags(const BackendNdl *ctx,
+static uint32_t backend_ndl_loaded_feed_flags(const BackendNdl *ctx,
                                               const BackendNdlMediaConfig *media) {
-    uint64_t flags = 0;
+    uint32_t flags = 0;
     if (media->has_video) flags |= BACKEND_NDL_FEED_VIDEO_READY;
     if (media->has_audio) flags |= BACKEND_NDL_FEED_AUDIO_READY;
     if (media->has_video && ctx->config.require_keyframe_after_reload) {
@@ -486,6 +485,7 @@ static BackendNdlResult backend_ndl_unload_locked(BackendNdl *ctx) {
                         backend_ndl_last_error(ctx));
         return BACKEND_NDL_ERROR;
     }
+    backend_ndl_gst_unload(ctx);
     ctx->media_loaded = false;
     atomic_store_explicit(&ctx->loaded_start_ms, 0, memory_order_release);
     BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO, "media unloaded");
@@ -495,14 +495,17 @@ static BackendNdlResult backend_ndl_unload_locked(BackendNdl *ctx) {
 static BackendNdlResult backend_ndl_load_media_info_locked(
     BackendNdl *ctx,
     BackendNdlMediaInfo *info,
+    const BackendNdlMediaConfig *media,
     const char *operation) {
     int rc;
     backend_ndl_video_before_load_locked(ctx);
+    backend_ndl_gst_load_begin(ctx, media);
     if (ctx->abi_profile == BACKEND_NDL_ABI_V2_WINDOW_ID_INIT) {
         rc = ctx->api.DirectMediaLoadCurrent(&info->current, backend_ndl_load_callback);
     } else {
         rc = ctx->api.DirectMediaLoadCallback(&info->callback, backend_ndl_load_callback);
     }
+    backend_ndl_gst_load_end(ctx, rc == 0);
     if (rc != 0) {
         BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_ERROR,
                         "NDL_DirectMediaLoad (%s) failed rc=%d error=%s", operation, rc,
@@ -515,7 +518,7 @@ static BackendNdlResult backend_ndl_load_media_info_locked(
 static BackendNdlResult backend_ndl_publish_loaded_locked(
     BackendNdl *ctx,
     const BackendNdlMediaConfig *media,
-    uint64_t transition_state) {
+    uint32_t transition_state) {
     ctx->media = *media;
     ctx->media_loaded = true;
     atomic_store_explicit(&ctx->loaded_start_ms, backend_ndl_monotonic_ms(),
@@ -535,11 +538,11 @@ static BackendNdlResult backend_ndl_publish_loaded_locked(
 
     backend_ndl_video_reset_runtime_stats(ctx);
 
-    uint64_t flags = backend_ndl_loaded_feed_flags(ctx, media);
+    uint32_t flags = backend_ndl_loaded_feed_flags(ctx, media);
     atomic_store_explicit(&ctx->feed_state, transition_state | flags, memory_order_release);
     BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO,
-                    "media loaded: generation=%llu video=%s audio=%s",
-                    (unsigned long long)ctx->reload_generation,
+                    "media loaded: generation=%u video=%s audio=%s",
+                    ctx->reload_generation,
                     media->has_video ? "yes" : "no", media->has_audio ? "yes" : "no");
     return BACKEND_NDL_OK;
 }
@@ -573,12 +576,12 @@ static BackendNdlResult backend_ndl_replace_media_locked(
         }
     }
 
-    uint64_t previous_state = 0;
-    uint64_t transition_state =
+    uint32_t previous_state = 0;
+    uint32_t transition_state =
         backend_ndl_begin_generation_locked(ctx, &previous_state);
     BackendNdlResult unload_result = backend_ndl_unload_locked(ctx);
     if (unload_result != BACKEND_NDL_OK) {
-        uint64_t previous_flags = previous_state & BACKEND_NDL_FEED_FLAG_MASK;
+        uint32_t previous_flags = previous_state & BACKEND_NDL_FEED_FLAG_MASK;
         atomic_store_explicit(&ctx->feed_state, transition_state | previous_flags,
                               memory_order_release);
         return unload_result;
@@ -590,7 +593,7 @@ static BackendNdlResult backend_ndl_replace_media_locked(
     }
 
     BackendNdlResult load_result =
-        backend_ndl_load_media_info_locked(ctx, &next_info, "reconfigure");
+        backend_ndl_load_media_info_locked(ctx, &next_info, next, "reconfigure");
     if (load_result == BACKEND_NDL_OK) {
         load_result =
             backend_ndl_publish_loaded_locked(ctx, next, transition_state);
@@ -604,7 +607,7 @@ static BackendNdlResult backend_ndl_replace_media_locked(
     }
     if (previous_loaded && !ctx->media_loaded) {
         BackendNdlResult restore_result =
-            backend_ndl_load_media_info_locked(ctx, &previous_info, "restore");
+            backend_ndl_load_media_info_locked(ctx, &previous_info, &previous, "restore");
         if (restore_result == BACKEND_NDL_OK) {
             restore_result =
                 backend_ndl_publish_loaded_locked(ctx, &previous, transition_state);
@@ -639,7 +642,7 @@ static BackendNdlResult backend_ndl_replace_media_locked(
 static bool backend_ndl_video_info_equal(const BackendNdlVideoInfo *left,
                                          const BackendNdlVideoInfo *right) {
     return left->codec == right->codec && left->width == right->width &&
-           left->height == right->height;
+           left->height == right->height && left->app_type == right->app_type;
 }
 
 static BackendNdlResult backend_ndl_reload_locked(BackendNdl *ctx) {
@@ -728,6 +731,14 @@ static BackendNdl *backend_ndl_open_common(const BackendNdlConfig *config,
         free(ctx);
         return NULL;
     }
+    if (!backend_ndl_gst_open(ctx)) {
+        free(ctx->webos_sdk_version);
+        free(ctx->window_id);
+        free(ctx->app_id);
+        pthread_mutex_destroy(&ctx->lifecycle_lock);
+        free(ctx);
+        return NULL;
+    }
     ctx->config.app_id = ctx->app_id;
     ctx->config.window_id = ctx->window_id;
     ctx->config.webos_sdk_version = ctx->webos_sdk_version;
@@ -735,6 +746,7 @@ static BackendNdl *backend_ndl_open_common(const BackendNdlConfig *config,
     pthread_mutex_lock(&g_backend_ndl_registry_lock);
     if (g_backend_ndl_active) {
         pthread_mutex_unlock(&g_backend_ndl_registry_lock);
+        backend_ndl_gst_close(ctx);
         free(ctx->webos_sdk_version);
         free(ctx->window_id);
         free(ctx->app_id);
@@ -809,10 +821,10 @@ static BackendNdl *backend_ndl_open_common(const BackendNdlConfig *config,
                         ctx->webos_sdk_version);
     }
     BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_INFO,
-                    "initialized app_id=%s sdk=%s profile=%s capabilities=0x%llx",
+                    "initialized app_id=%s sdk=%s profile=%s capabilities=0x%x",
                     ctx->app_id, ctx->webos_sdk_version ? ctx->webos_sdk_version : "unknown",
                     backend_ndl_abi_profile_name(ctx->abi_profile),
-                    (unsigned long long)ctx->capabilities);
+                    ctx->capabilities);
     return ctx;
 }
 
@@ -870,6 +882,7 @@ void backend_ndl_close(BackendNdl *ctx) {
 
     /* With the claim lost the handle leaks deliberately: the process is dying
      * and the claimant may still be executing facade code. */
+    backend_ndl_gst_close(ctx);
     if (ctx->owns_dl_handle && facade_owned) dlclose(ctx->dl_handle);
     free(ctx->webos_sdk_version);
     free(ctx->window_id);
@@ -929,6 +942,9 @@ BackendNdlResult backend_ndl_set_media(BackendNdl *ctx,
         }
     }
 
+    BackendNdlResult profile_result = backend_ndl_gst_validate(video, audio);
+    if (profile_result != BACKEND_NDL_OK) return profile_result;
+
     BackendNdlMediaConfig next = {0};
     next.has_video = video != NULL;
     next.has_audio = audio != NULL;
@@ -960,7 +976,7 @@ BackendNdlResult backend_ndl_reload(BackendNdl *ctx) {
 
 long long backend_ndl_media_time_ms(const BackendNdl *ctx) {
     if (!ctx) return 0;
-    uint64_t state = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
+    uint32_t state = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
     return backend_ndl_media_time_for_state(ctx, state);
 }
 

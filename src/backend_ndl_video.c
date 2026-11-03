@@ -111,13 +111,9 @@ void backend_ndl_video_after_load_locked(BackendNdl *ctx) {
     }
 }
 
-static bool backend_ndl_video_state_ready(uint64_t initial, uint64_t current) {
+static bool backend_ndl_video_state_ready(uint32_t initial, uint32_t current) {
     return backend_ndl_feed_generation(initial) == backend_ndl_feed_generation(current) &&
            (current & BACKEND_NDL_FEED_VIDEO_READY) != 0;
-}
-
-static uint32_t backend_ndl_video_stats_tag(unsigned long long epoch) {
-    return (uint32_t)epoch;
 }
 
 static unsigned long long backend_ndl_video_stats_pack(uint32_t tag, uint32_t value) {
@@ -263,10 +259,10 @@ static void backend_ndl_video_stats_writer_end(BackendNdl *ctx, uint32_t tag) {
 }
 
 void backend_ndl_video_reset_runtime_stats(BackendNdl *ctx) {
-    unsigned long long epoch =
+    uint32_t epoch =
         atomic_load_explicit(&ctx->video_stats_epoch, memory_order_relaxed);
-    unsigned long long next_epoch = epoch == ULLONG_MAX ? 1 : epoch + 1;
-    uint32_t tag = backend_ndl_video_stats_tag(next_epoch);
+    uint32_t next_epoch = epoch == UINT32_MAX ? 1 : epoch + 1;
+    uint32_t tag = next_epoch;
     unsigned long long empty = backend_ndl_video_stats_pack(tag, 0);
 
     /* Publish the writer tag first so an old writer either finishes before
@@ -284,10 +280,10 @@ void backend_ndl_video_reset_runtime_stats(BackendNdl *ctx) {
 }
 
 static void backend_ndl_video_record_runtime(BackendNdl *ctx,
-                                             unsigned long long expected_epoch,
+                                             uint32_t expected_epoch,
                                              long long elapsed_us,
                                              bool failed) {
-    uint32_t tag = backend_ndl_video_stats_tag(expected_epoch);
+    uint32_t tag = expected_epoch;
     if (!backend_ndl_video_stats_writer_begin(ctx, tag)) {
         return;
     }
@@ -298,8 +294,8 @@ static void backend_ndl_video_record_runtime(BackendNdl *ctx,
     }
 #endif
 
-    unsigned long long sample = elapsed_us > 0 ? (unsigned long long)elapsed_us : 0;
-    uint32_t bounded_sample = sample > UINT32_MAX ? UINT32_MAX : (uint32_t)sample;
+    uint32_t bounded_sample = elapsed_us <= 0 ? 0
+        : elapsed_us > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed_us;
     backend_ndl_video_stats_update_ewma(ctx, tag, bounded_sample);
     backend_ndl_video_stats_update_max(ctx, tag, bounded_sample);
     if (failed) {
@@ -315,7 +311,7 @@ static void backend_ndl_video_record_runtime(BackendNdl *ctx,
 void backend_ndl_test_record_video_runtime(BackendNdl *ctx,
                                            uint32_t elapsed_us,
                                            bool failed) {
-    unsigned long long epoch =
+    uint32_t epoch =
         atomic_load_explicit(&ctx->video_stats_epoch, memory_order_acquire);
     backend_ndl_video_record_runtime(ctx, epoch, elapsed_us, failed);
 }
@@ -326,14 +322,28 @@ BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
                                         size_t len,
                                         long long ndl_pts,
                                         bool is_keyframe) {
+    return backend_ndl_feed_video_ex(ctx, data, len, ndl_pts, is_keyframe, 0);
+}
+
+BackendNdlResult backend_ndl_feed_video_ex(BackendNdl *ctx, const void *data, size_t len,
+                                           long long ndl_pts, bool is_keyframe,
+                                           uint32_t flags) {
     if (!ctx || !data || len == 0 || len > UINT32_MAX) {
         return BACKEND_NDL_INVALID_ARGUMENT;
     }
-    if (!ctx->api.DirectVideoPlay) {
-        return BACKEND_NDL_UNAVAILABLE;
+    if ((flags & ~(BACKEND_NDL_VIDEO_DECODE_ONLY | BACKEND_NDL_VIDEO_CONFIG_ONLY)) ||
+        ((flags & BACKEND_NDL_VIDEO_CONFIG_ONLY) &&
+         ((flags & BACKEND_NDL_VIDEO_DECODE_ONLY) || is_keyframe))) {
+        return BACKEND_NDL_INVALID_ARGUMENT;
     }
-
-    uint64_t state = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
+    if (!ctx->api.DirectVideoPlay) return BACKEND_NDL_UNAVAILABLE;
+    BackendNdlVideoStatus path;
+    backend_ndl_get_video_status(ctx, &path);
+    if (path.state == BACKEND_NDL_VIDEO_PATH_FAILED) return BACKEND_NDL_ERROR;
+    if (path.state != BACKEND_NDL_VIDEO_PATH_READY) return BACKEND_NDL_NOT_READY;
+    if ((flags & BACKEND_NDL_VIDEO_DECODE_ONLY) && !path.supports_decode_only)
+        return BACKEND_NDL_UNSUPPORTED;
+    uint32_t state = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
     if ((state & BACKEND_NDL_FEED_VIDEO_READY) == 0) {
         return BACKEND_NDL_NOT_READY;
     }
@@ -344,9 +354,9 @@ BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
         ndl_pts = backend_ndl_media_time_for_state(ctx, state);
     }
 
-    unsigned long long stats_epoch =
+    uint32_t stats_epoch =
         atomic_load_explicit(&ctx->video_stats_epoch, memory_order_acquire);
-    uint64_t before_play = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
+    uint32_t before_play = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
     if (!backend_ndl_video_state_ready(state, before_play)) {
         return (before_play & BACKEND_NDL_FEED_VIDEO_READY) != 0
                    ? BACKEND_NDL_NEED_KEYFRAME
@@ -354,16 +364,21 @@ BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
     }
 
     long long started_us = backend_ndl_monotonic_us();
+    void *submission = backend_ndl_gst_feed_begin(ctx, flags);
     int rc = ctx->api.DirectVideoPlay((void *)data, (unsigned int)len, ndl_pts);
+    BackendNdlResult gst_result = backend_ndl_gst_feed_end(submission);
     long long finished_us = backend_ndl_monotonic_us();
     backend_ndl_video_record_runtime(ctx, stats_epoch, finished_us - started_us,
                                      rc != 0);
-    uint64_t after_play = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
+    uint32_t after_play = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
     if (!backend_ndl_video_state_ready(state, after_play)) {
         return (after_play & BACKEND_NDL_FEED_VIDEO_READY) != 0
                    ? BACKEND_NDL_NEED_KEYFRAME
                    : BACKEND_NDL_NOT_READY;
     }
+    backend_ndl_get_video_status(ctx, &path);
+    if (gst_result != BACKEND_NDL_OK || path.state == BACKEND_NDL_VIDEO_PATH_FAILED)
+        return BACKEND_NDL_ERROR;
     if (rc != 0) {
         unsigned int streak = atomic_fetch_add_explicit(&ctx->video_error_streak, 1,
                                                          memory_order_relaxed) + 1;
@@ -378,8 +393,8 @@ BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
     atomic_store_explicit(&ctx->video_error_streak, 0, memory_order_relaxed);
 
     if (is_keyframe && (after_play & BACKEND_NDL_FEED_NEED_KEYFRAME) != 0) {
-        unsigned long long expected = after_play;
-        unsigned long long desired = after_play & ~BACKEND_NDL_FEED_NEED_KEYFRAME;
+        uint32_t expected = after_play;
+        uint32_t desired = after_play & ~BACKEND_NDL_FEED_NEED_KEYFRAME;
         if (!atomic_compare_exchange_strong_explicit(&ctx->feed_state, &expected, desired,
                                                      memory_order_acq_rel,
                                                      memory_order_acquire) &&
@@ -390,7 +405,7 @@ BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
         }
     }
 
-    unsigned long long count = atomic_fetch_add_explicit(&ctx->video_feed_count, 1,
+    uint32_t count = atomic_fetch_add_explicit(&ctx->video_feed_count, 1,
                                                           memory_order_relaxed) + 1;
     if (backend_ndl_log_enabled(ctx, BACKEND_NDL_LOG_DEBUG) &&
         count % BACKEND_NDL_VIDEO_DEBUG_CADENCE == 0) {
@@ -402,11 +417,23 @@ BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
         (void)backend_ndl_get_runtime_stats(ctx, &stats);
         BACKEND_NDL_DEBUG_LOG(
             ctx,
-            "video sink: fed=%llu render_queue=%d pts=%lld play_calls=%u "
+            "video sink: fed=%u render_queue=%d pts=%lld play_calls=%u "
             "play_us_ewma=%u play_us_max=%u play_errors=%u",
             count, depth, ndl_pts, stats.video_play_samples, stats.video_play_us_ewma,
             stats.video_play_us_max, stats.video_play_errors);
     }
+    return BACKEND_NDL_OK;
+}
+
+BackendNdlResult backend_ndl_get_video_status(const BackendNdl *ctx,
+                                              BackendNdlVideoStatus *out) {
+    if (!ctx || !out) return BACKEND_NDL_INVALID_ARGUMENT;
+    memset(out, 0, sizeof(*out));
+    uint32_t state = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
+    out->generation = backend_ndl_feed_generation(state);
+    out->state = (state & BACKEND_NDL_FEED_VIDEO_READY)
+                     ? BACKEND_NDL_VIDEO_PATH_READY : BACKEND_NDL_VIDEO_PATH_NOT_READY;
+    backend_ndl_gst_status(ctx, out);
     return BACKEND_NDL_OK;
 }
 
@@ -421,9 +448,9 @@ BackendNdlResult backend_ndl_get_runtime_stats(const BackendNdl *ctx,
     uint32_t maximum;
     uint32_t errors;
     for (;;) {
-        unsigned long long epoch =
+        uint32_t epoch =
             atomic_load_explicit(&ctx->video_stats_epoch, memory_order_acquire);
-        uint32_t tag = backend_ndl_video_stats_tag(epoch);
+        uint32_t tag = epoch;
         unsigned long long writers_before =
             atomic_load_explicit(&ctx->video_stats_writers, memory_order_acquire);
         unsigned long long version_before =
@@ -456,7 +483,7 @@ BackendNdlResult backend_ndl_get_runtime_stats(const BackendNdl *ctx,
             atomic_load_explicit(&ctx->video_stats_writers, memory_order_acquire);
         unsigned long long version_after =
             atomic_load_explicit(&ctx->video_stats_version, memory_order_acquire);
-        unsigned long long epoch_after =
+        uint32_t epoch_after =
             atomic_load_explicit(&ctx->video_stats_epoch, memory_order_acquire);
         if (epoch != epoch_after || version_before != version_after ||
             writers_before != writers_after) {
@@ -488,6 +515,7 @@ BackendNdlResult backend_ndl_flush_video_render_buffer(BackendNdl *ctx) {
     if (!ctx) return BACKEND_NDL_INVALID_ARGUMENT;
     if (!ctx->api.DirectVideoFlushRenderBuffer) return BACKEND_NDL_UNAVAILABLE;
     pthread_mutex_lock(&ctx->lifecycle_lock);
+    backend_ndl_gst_flush(ctx);
     int rc = ctx->api.DirectVideoFlushRenderBuffer();
     pthread_mutex_unlock(&ctx->lifecycle_lock);
     return rc == 0 ? BACKEND_NDL_OK : BACKEND_NDL_ERROR;

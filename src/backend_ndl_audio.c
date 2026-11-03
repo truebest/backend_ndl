@@ -143,8 +143,8 @@ BackendNdlResult backend_ndl_audio_after_load_locked(BackendNdl *ctx) {
         silence = (void *)opus_stereo_silence;
         size = sizeof(opus_stereo_silence);
     }
-    uint64_t transition = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
-    uint64_t temporary = transition | BACKEND_NDL_FEED_AUDIO_READY;
+    uint32_t transition = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
+    uint32_t temporary = transition | BACKEND_NDL_FEED_AUDIO_READY;
     long long pts = backend_ndl_media_time_for_state(ctx, temporary);
     int rc = ctx->api.DirectAudioPlay(silence, size, pts);
     if (rc != 0) {
@@ -235,7 +235,7 @@ void backend_ndl_audio_register_capability_callback(BackendNdl *ctx) {
     }
 }
 
-static bool backend_ndl_audio_state_ready(uint64_t initial, uint64_t current) {
+static bool backend_ndl_audio_state_ready(uint32_t initial, uint32_t current) {
     return backend_ndl_feed_generation(initial) == backend_ndl_feed_generation(current) &&
            (current & BACKEND_NDL_FEED_AUDIO_READY) != 0;
 }
@@ -251,7 +251,7 @@ BackendNdlResult backend_ndl_feed_audio(BackendNdl *ctx,
         return BACKEND_NDL_UNAVAILABLE;
     }
 
-    uint64_t state = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
+    uint32_t state = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
     if ((state & BACKEND_NDL_FEED_AUDIO_READY) == 0) {
         atomic_fetch_add_explicit(&ctx->audio_not_ready_streak, 1, memory_order_relaxed);
         return BACKEND_NDL_NOT_READY;
@@ -260,7 +260,7 @@ BackendNdlResult backend_ndl_feed_audio(BackendNdl *ctx,
     if (ctx->config.guard_audio_overflow && ctx->api.DirectAudioGetAvailableBufferSize) {
         int available = -1;
         if (ctx->api.DirectAudioGetAvailableBufferSize(&available) == 0) {
-            uint64_t after_guard = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
+            uint32_t after_guard = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
             if (!backend_ndl_audio_state_ready(state, after_guard)) {
                 atomic_fetch_add_explicit(&ctx->audio_not_ready_streak, 1,
                                           memory_order_relaxed);
@@ -281,14 +281,14 @@ BackendNdlResult backend_ndl_feed_audio(BackendNdl *ctx,
     if (ndl_pts == BACKEND_NDL_PTS_AUTO) {
         ndl_pts = backend_ndl_media_time_for_state(ctx, state);
     }
-    uint64_t before_play = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
+    uint32_t before_play = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
     if (!backend_ndl_audio_state_ready(state, before_play)) {
         atomic_fetch_add_explicit(&ctx->audio_not_ready_streak, 1, memory_order_relaxed);
         return BACKEND_NDL_NOT_READY;
     }
 
     int rc = ctx->api.DirectAudioPlay((void *)data, (unsigned int)len, ndl_pts);
-    uint64_t after_play = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
+    uint32_t after_play = atomic_load_explicit(&ctx->feed_state, memory_order_acquire);
     if (!backend_ndl_audio_state_ready(state, after_play)) {
         atomic_fetch_add_explicit(&ctx->audio_not_ready_streak, 1, memory_order_relaxed);
         return BACKEND_NDL_NOT_READY;
@@ -316,7 +316,7 @@ BackendNdlResult backend_ndl_feed_audio(BackendNdl *ctx,
                         overflow, not_ready);
     }
 
-    unsigned long long count = atomic_fetch_add_explicit(&ctx->audio_feed_count, 1,
+    uint32_t count = atomic_fetch_add_explicit(&ctx->audio_feed_count, 1,
                                                           memory_order_relaxed) + 1;
     if (backend_ndl_log_enabled(ctx, BACKEND_NDL_LOG_DEBUG) &&
         count % BACKEND_NDL_AUDIO_DEBUG_CADENCE == 0 &&
@@ -327,7 +327,7 @@ BackendNdlResult backend_ndl_feed_audio(BackendNdl *ctx,
             if (ctx->api.DirectAudioGetTotalBufferSize) {
                 (void)ctx->api.DirectAudioGetTotalBufferSize(&total);
             }
-            BACKEND_NDL_DEBUG_LOG(ctx, "audio sink: fed=%llu available=%d total=%d pts=%lld",
+            BACKEND_NDL_DEBUG_LOG(ctx, "audio sink: fed=%u available=%d total=%d pts=%lld",
                                   count, available, total, ndl_pts);
         }
     }

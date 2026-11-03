@@ -1142,3 +1142,25 @@ TEST(BackendNdl, ValidationAndNames) {
     EXPECT_STREQ(backend_ndl_result_name(BACKEND_NDL_NEED_KEYFRAME), "NEED_KEYFRAME");
     EXPECT_STREQ(backend_ndl_log_level_name(BACKEND_NDL_LOG_WARN), "WARN");
 }
+
+TEST(BackendNdl, ExtendedVideoFlagsAndProfileValidation) {
+    fake_reset();
+    BackendNdlApi api = fake_api_full();
+    BackendNdlHandle ctx(open_test_backend(&api));
+    ASSERT_NE(ctx, nullptr);
+    BackendNdlVideoInfo video{BACKEND_NDL_VIDEO_H264, 1920, 1080};
+    ASSERT_EQ(backend_ndl_set_media(ctx.get(), &video, nullptr), BACKEND_NDL_OK);
+    unsigned char data = 0;
+    EXPECT_EQ(backend_ndl_feed_video_ex(ctx.get(), &data, 1, 0, true, 4), BACKEND_NDL_INVALID_ARGUMENT);
+    EXPECT_EQ(backend_ndl_feed_video_ex(ctx.get(), &data, 1, 0, true, BACKEND_NDL_VIDEO_CONFIG_ONLY), BACKEND_NDL_INVALID_ARGUMENT);
+    EXPECT_EQ(backend_ndl_feed_video_ex(ctx.get(), &data, 1, 0, false, 3), BACKEND_NDL_INVALID_ARGUMENT);
+    EXPECT_EQ(backend_ndl_feed_video_ex(ctx.get(), &data, 1, 0, false, BACKEND_NDL_VIDEO_DECODE_ONLY), BACKEND_NDL_UNSUPPORTED);
+    video.app_type = static_cast<BackendNdlAppType>(99);
+    EXPECT_EQ(backend_ndl_set_media(ctx.get(), &video, nullptr), BACKEND_NDL_INVALID_ARGUMENT);
+#if !BACKEND_NDL_TEST_HAS_GSTREAMER
+    for (int type = BACKEND_NDL_APP_RTC; type <= BACKEND_NDL_APP_SYE; ++type) {
+        video.app_type = static_cast<BackendNdlAppType>(type);
+        EXPECT_EQ(backend_ndl_set_media(ctx.get(), &video, nullptr), BACKEND_NDL_UNSUPPORTED);
+    }
+#endif
+}
